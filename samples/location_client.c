@@ -26,7 +26,7 @@
 
 #define  POINT_FRQ      3000
 
-#define  ACCESS_KEY     "SCVXgNIdKCYBeNkWY4W1UGw6NCEcGq7K" // 需要申请
+#define  ACCESS_KEY     "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" // 需要申请
 
 static void location_client_entry(void *parament)
 {
