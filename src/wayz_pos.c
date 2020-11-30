@@ -19,7 +19,7 @@ const double a = 6378245.0;
 const double ee = 0.00669342162296594323;
 const double pi = 3.14159265358979324;
 
-static unsigned char outOfChina(double lat, double lon)
+static unsigned char _outOfChina(double lat, double lon)
 {
     if (lon < 72.004 || lon > 137.8347)
         return 1;
@@ -28,7 +28,7 @@ static unsigned char outOfChina(double lat, double lon)
     return 0;
 }
 
-static double transformLat(double x, double y)
+static double _transformLat(double x, double y)
 {
     double ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * sqrt(abs(x));
     ret += (20.0 * sin(6.0 * x * pi) + 20.0 * sin(2.0 * x * pi)) * 2.0 / 3.0;
@@ -37,7 +37,7 @@ static double transformLat(double x, double y)
     return ret;
 }
 
-static double transformLon(double x, double y)
+static double _transformLon(double x, double y)
 {
     double ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * sqrt(abs(x));
     ret += (20.0 * sin(6.0 * x * pi) + 20.0 * sin(2.0 * x * pi)) * 2.0 / 3.0;
@@ -48,14 +48,14 @@ static double transformLon(double x, double y)
 
 static void gps_transform( double wgLat, double wgLon, double * mgLat, double* mgLon)
 {
-    if (outOfChina(wgLat, wgLon))
+    if (_outOfChina(wgLat, wgLon))
     {
         *mgLat = wgLat;
         *mgLon = wgLon;
         return;
     }
-    double dLat = transformLat(wgLon - 105.0, wgLat - 35.0);
-    double dLon = transformLon(wgLon - 105.0, wgLat - 35.0);
+    double dLat = _transformLat(wgLon - 105.0, wgLat - 35.0);
+    double dLon = _transformLon(wgLon - 105.0, wgLat - 35.0);
     double radLat = wgLat / 180.0 * pi;
     double magic = sin(radLat);
     magic = 1 - ee * magic * magic;
@@ -105,7 +105,7 @@ static void wayz_error(char* msg)
     rt_kprintf("\033[31;22m[E/wayz]: ERROR %s\033[0m\n", msg); // Print the error message to stderr.
 }
 
-static void print_scan_result(struct rt_wlan_scan_result *scan_result)
+static void _handler_scan_result(struct rt_wlan_scan_result *scan_result)
 {
     int index, num;
 
@@ -144,7 +144,7 @@ static void get_wifi_scan_info()
     {
         rt_kprintf("the scan is complete, results is as follows: \n");
         /* print scan results */
-        print_scan_result(scan_result);
+        _handler_scan_result(scan_result);
         /* clean scan results */
         rt_wlan_scan_result_clean();
     }
@@ -481,11 +481,13 @@ static char * register_dev_cjson_handler(tdeviec_info *dev_info)
     root = cJSON_CreateArray();
 
     rt_sprintf(temp, "%01d.%01d.%01d", VER_H, VER_M, VER_L);
-    rt_sprintf(macBuf, ""MACPRINT, PRINT(aucApInfo.sta_mac, 0));
+    rt_sprintf(macBuf, ""MACPRINTID, PRINT(aucApInfo.sta_mac, 0));
     cJSON_AddItemToArray(root, fmt = cJSON_CreateObject());
     cJSON_AddStringToObject(fmt, "id", macBuf);
     cJSON_AddStringToObject(fmt, "name", dev_info->dev_name);
     cJSON_AddStringToObject(fmt, "manufacturer", dev_info->manufacturer);
+    rt_memset(macBuf, 0, sizeof (macBuf));
+    rt_sprintf(macBuf, ""MACPRINT, PRINT(aucApInfo.sta_mac, 0));
     cJSON_AddStringToObject(fmt, "macAddress", macBuf);
     cJSON_AddStringToObject(fmt, "serialNumber", dev_info->SN);
     cJSON_AddItemToObject(fmt, "firmware", img = cJSON_CreateObject());
@@ -572,7 +574,7 @@ static rt_uint8_t query_device()
         goto _malloc_fail;
     }
     rt_memset(url, 0, rt_strlen(DEV_QUERY_URL) + MAC_LEN + rt_strlen(access_key));
-    rt_sprintf(mac_addr, ""MACPRINT, PRINT(aucApInfo.sta_mac, 0));
+    rt_sprintf(mac_addr, ""MACPRINTID, PRINT(aucApInfo.sta_mac, 0));
     rt_sprintf(url, ""DEV_QUERY_URL, mac_addr, access_key);
     buffer = wayz_webclient_get_data(url);
     if (rt_memcmp(buffer, STR_ERROR, rt_strlen(STR_ERROR)) == 0)
@@ -623,11 +625,12 @@ static rt_uint8_t register_device(tdeviec_info *dev_info)
         result = RT_ERROR;
         goto _url_fail;
     }
-    rt_sprintf(mac_addr, ""MACPRINT, PRINT(aucApInfo.sta_mac, 0));
+    rt_sprintf(mac_addr, ""MACPRINTID, PRINT(aucApInfo.sta_mac, 0));
     temp = rt_strstr((char *)buffer, mac_addr);
     if (RT_NULL == temp)
     {
         result = RT_ERROR;
+        rt_kprintf("\033[31;22m[E/wayz]: register buffer %s\033[0m\r\n", buffer);
         goto _query_fail;
     }
     result = RT_EOK;
@@ -701,7 +704,7 @@ char dev_register_init(twifi_info *wlan_info, tdeviec_info *dev_info, char *key)
     }
     else
     {
-        wayz_error("register device failure.\r\n");
+        wayz_error("register device failure.");
         return DEV_REGISTER_FAIL;
     }
 

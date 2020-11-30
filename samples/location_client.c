@@ -7,15 +7,15 @@
 
 
 #ifdef PKG_WAYZ_IOTKIT_WIFI_SSID
-#define  WAYZ_WIFI_SSID      PKG_WAYZ_IOTKIT_WIFI_SSID
+#define  WAYZ_WIFI_SSID      "Honor9"
 #else
-#define  WAYZ_WIFI_SSID      "thread"
+#define  WAYZ_WIFI_SSID      "Honor9"
 #endif
 
 #ifdef PKG_WAYZ_IOTKIT_WIFI_PASSWORD
-#define  WAYZ_WIFI_PWD      PKG_WAYZ_IOTKIT_WIFI_PASSWORD
+#define  WAYZ_WIFI_PWD      "316157666"
 #else
-#define  WAYZ_WIFI_PWD      "12345678"
+#define  WAYZ_WIFI_PWD      "316157666"
 #endif
 
 #define  DEV_NAME       "PANDDRA"
@@ -26,7 +26,7 @@
 
 #define  POINT_FRQ      3000
 
-#define  ACCESS_KEY     "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" // 需要申请
+#define  ACCESS_KEY     "SCVXgNIdKCYBeNkWY4W1UGw6NCEcGq7K" // 需要申请
 
 static void location_client_entry(void *parament)
 {
