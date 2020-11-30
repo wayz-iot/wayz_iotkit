@@ -7,15 +7,15 @@
 
 
 #ifdef PKG_WAYZ_IOTKIT_WIFI_SSID
-#define  WAYZ_WIFI_SSID      "Honor9"
+#define  WAYZ_WIFI_SSID      PKG_WAYZ_IOTKIT_WIFI_SSID
 #else
-#define  WAYZ_WIFI_SSID      "Honor9"
+#define  WAYZ_WIFI_SSID      "thread"
 #endif
 
 #ifdef PKG_WAYZ_IOTKIT_WIFI_PASSWORD
-#define  WAYZ_WIFI_PWD      "316157666"
+#define  WAYZ_WIFI_PWD      PKG_WAYZ_IOTKIT_WIFI_PASSWORD
 #else
-#define  WAYZ_WIFI_PWD      "316157666"
+#define  WAYZ_WIFI_PWD      "12345678"
 #endif
 
 #define  DEV_NAME       "PANDDRA"
