@@ -58,17 +58,19 @@ char dev_register_init(twifi_info *wlan_info, tdeviec_info *dev_info, char *key)
 /**
  * Get the positioning result function
  * 
- * @param wlan_info: Wifi related information
+ * @param wlan_info Wifi related information
  * 
- * @param key: Visiting the website key
+ * @param key Visiting the website key
  * 
- * @param location: get location result
+ * @param post_data post gnss and cellulars data, obtain positioning results
+ * 
+ * @param location get location result
  * 
  * @return >0: success
  *         =0: location failure
  * 
 */
-char get_position_info(twifi_info *wlan_info, char *key, tlocation_info *location);
+char get_position_info(twifi_info *wlan_info, char *key, tpost_data *post_data, tlocation_info *location);
 
 /**
  * print location result

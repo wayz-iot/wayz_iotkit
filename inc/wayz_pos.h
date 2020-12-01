@@ -31,6 +31,8 @@
 
 #define  STR_ERROR           "1"
 
+#define  CELL_COUNT          32
+
 #pragma pack(push)
 #pragma pack(1)
 
@@ -39,6 +41,14 @@ enum
     WIFI_CONNECT_FAIL = 0,
     DEV_REGISTER_OK,
     DEV_REGISTER_FAIL
+};
+
+enum rd_type
+{
+    GSM = 0,
+    WCDMA,
+    LTE,
+    CDMA
 };
 
 typedef struct _ap_struct_info_
@@ -112,6 +122,35 @@ typedef struct _location_info_
     uint64_t timestamp;  // When to locate the result
 }tlocation_info;
 
+typedef struct _gnss_unit_
+{
+    uint64_t timestamp;
+    double lng; // longitude
+    double lat; // latitude 
+    float accuracy; // Horizontal accuracy of satellite positioning, unit: meter
+}tgnss_unit;
+
+typedef struct _cell_unit_
+{
+    uint64_t timestamp;
+    uint32_t cellId;
+    char radio_type[7]; // Base station type, can only be the following values: GSM, WCDMA, LTE, CDMA
+    uint32_t mcc; // mobileCountryCode
+    uint32_t mnc; // mobileNetworkCode
+    uint32_t lac; // locationAreaCode
+}tcell_unit;
+
+typedef struct _cell_
+{
+    tcell_unit cell[CELL_COUNT];
+    uint8_t count;
+}tcell;
+
+typedef struct _post_data_
+{
+    tgnss_unit gnss;
+    tcell cellulars;
+}tpost_data;
 
 
 #pragma pack(pop)
@@ -176,13 +215,15 @@ char dev_register_init(twifi_info *wlan_info, tdeviec_info *dev_info, char *key)
  * 
  * @param key Visiting the website key
  * 
+ * @param post_data post gnss and cellulars data, obtain positioning results
+ * 
  * @param location get location result
  * 
  * @return >0: success
  *         =0: location failure
  * 
 */
-char get_position_info(twifi_info *wlan_info, char *key, tlocation_info *location);
+char get_position_info(twifi_info *wlan_info, char *key, tpost_data *post_data, tlocation_info *location);
 
 /**
  * print location result

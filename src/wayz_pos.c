@@ -19,6 +19,33 @@ const double a = 6378245.0;
 const double ee = 0.00669342162296594323;
 const double pi = 3.14159265358979324;
 
+#define  FLOAT_EPS      1e-6
+#define  DOUBLE_EPS     1e-15
+
+static unsigned char check_double_equal_zero(double f)
+{
+    if(fabs(f) <= DOUBLE_EPS)
+    {
+        return RT_EOK;
+    }
+    else
+    {
+        return RT_ERROR;
+    }
+}
+
+static unsigned char check_float_equal_zero(float f)
+{
+    if(fabs(f) <= FLOAT_EPS)
+    {
+        return RT_EOK;
+    }
+    else
+    {
+        return RT_ERROR;
+    }
+}
+
 static unsigned char _outOfChina(double lat, double lon)
 {
     if (lon < 72.004 || lon > 137.8347)
@@ -275,7 +302,7 @@ _connected:
 //     return (FREQ_START + (channel - 1) * SEGMEMTATION);
 // }
 
-static char *point_cJson_handler(void)
+static char *point_cJson_handler(tpost_data *post_data)
 {
  /* declare a few. */
     cJSON *root = NULL;
@@ -287,6 +314,7 @@ static char *point_cJson_handler(void)
     char macBuf[MAC_LEN] = {0};
     char *cJsonBuffer = NULL;
     char *buffer = NULL;
+    unsigned char state = 0;
 
     root = cJSON_CreateObject();
 
@@ -314,25 +342,64 @@ static char *point_cJson_handler(void)
     rt_sprintf(macBuf, ""MACPRINT, PRINT(aucApInfo.sta_mac, 0));
     cJSON_AddItemToObject(fmt, "id", cJSON_CreateString(macBuf));
     cJSON_AddItemToObject(root, "location", img = cJSON_CreateObject());
-    cJSON_AddItemToObject(img, "wifis", thm = cJSON_CreateArray());
 
-    for (i = 0, j = 0; i < aucApInfo.count; i++)
+    // add wifis
+    if (aucApInfo.count >= 4)
     {
-        rt_sprintf(macBuf, ""MACPRINT, PRINT(aucApInfo.tinfoAp[i].mac, 0));
-        cJSON_AddItemToArray(thm, fld = cJSON_CreateObject());
-        cJSON_AddStringToObject(fld, "macAddress", macBuf);
-        // cJSON_AddStringToObject(fld, "ssid", "");
-        // cJSON_AddNumberToObject(fld, "frequency", chnTofreq(aucApInfo.tinfoAp[i].channel));
-        cJSON_AddNumberToObject(fld, "signalStrength", abs(aucApInfo.tinfoAp[i].rssi));
-        j ++;
-        if (j > 10)
+        cJSON_AddItemToObject(img, "wifis", thm = cJSON_CreateArray());
+        for (i = 0, j = 0; i < aucApInfo.count; i++)
         {
-            //break;
+            rt_sprintf(macBuf, ""MACPRINT, PRINT(aucApInfo.tinfoAp[i].mac, 0));
+            cJSON_AddItemToArray(thm, fld = cJSON_CreateObject());
+            cJSON_AddStringToObject(fld, "macAddress", macBuf);
+            // cJSON_AddStringToObject(fld, "ssid", "");
+            // cJSON_AddNumberToObject(fld, "frequency", chnTofreq(aucApInfo.tinfoAp[i].channel));
+            cJSON_AddNumberToObject(fld, "signalStrength", abs(aucApInfo.tinfoAp[i].rssi));
+            j ++;
+            if (j > 10)
+            {
+                //break;
+            }
+        }
+        state = 1;
+    }
+
+    if (RT_NULL != post_data)
+    {
+        // add gnss
+        if (RT_EOK != check_double_equal_zero(post_data->gnss.lng) && 
+            RT_EOK != check_double_equal_zero(post_data->gnss.lat) &&
+            RT_EOK != check_float_equal_zero(post_data->gnss.accuracy))
+        {
+            cJSON_AddItemToObject(img, "gnss", thm = cJSON_CreateObject());
+            cJSON_AddNumberToObject(thm, "timestamp", post_data->gnss.timestamp);
+            cJSON_AddItemToObject(thm, "point", fld = cJSON_CreateObject());
+            cJSON_AddNumberToObject(fld, "longitude", post_data->gnss.lng);
+            cJSON_AddNumberToObject(fld, "latitude", post_data->gnss.lat);
+            cJSON_AddNumberToObject(thm, "accuracy", post_data->gnss.accuracy);
+            state = 1;
+        }
+        // add cellulars
+        if (0 != post_data->cellulars.count)
+        {
+            cJSON_AddItemToObject(img, "cellulars", thm = cJSON_CreateArray());
+
+            for (i = 0; i < post_data->cellulars.count; i ++)
+            {
+                cJSON_AddItemToArray(thm, fld = cJSON_CreateObject());
+                cJSON_AddNumberToObject(fld, "timestamp", post_data->cellulars.cell[i].timestamp);
+                cJSON_AddNumberToObject(fld, "cellId", post_data->cellulars.cell[i].cellId);
+                cJSON_AddStringToObject(fld, "radioType", post_data->cellulars.cell[i].radio_type);
+                cJSON_AddNumberToObject(fld, "mobileCountryCode", post_data->cellulars.cell[i].mcc);
+                cJSON_AddNumberToObject(fld, "mobileNetworkCode", post_data->cellulars.cell[i].mnc);
+                cJSON_AddNumberToObject(fld, "locationAreaCode", post_data->cellulars.cell[i].lac);
+            }
+            state = 1;
         }
     }
-    
+
     cJsonBuffer = cJSON_Print(root);
-    buffer = (char *)rt_malloc(rt_strlen(cJsonBuffer) + 4);
+    buffer = (char *)rt_malloc(rt_strlen(cJsonBuffer));
     if (RT_NULL == buffer)
     {
         wayz_error("point_cJson_handler create malloc failure.");
@@ -343,6 +410,11 @@ static char *point_cJson_handler(void)
     cJSON_Delete(root);
     rt_free(cJsonBuffer);
 
+    if (1 != state)
+    {
+        wayz_error("location No wifi, GNSS, cellulars signal data");
+        return STR_ERROR;
+    }
     return buffer; // 需要free
 }
 
@@ -725,7 +797,7 @@ char dev_register_init(twifi_info *wlan_info, tdeviec_info *dev_info, char *key)
  *         =0: location failure
  * 
 */
-char get_position_info(twifi_info *wlan_info, char *key, tlocation_info *location)
+char get_position_info(twifi_info *wlan_info, char *key, tpost_data *post_data, tlocation_info *location)
 {
     char *url = RT_NULL;
     unsigned char *buffer = RT_NULL;
@@ -759,13 +831,20 @@ char get_position_info(twifi_info *wlan_info, char *key, tlocation_info *locatio
     }
     rt_memset(url, 0, rt_strlen(DEV_POSTION_URL) + rt_strlen(access_key));
     rt_sprintf(url, ""DEV_POSTION_URL, access_key);
-    cJsonBuffer = point_cJson_handler();
+    cJsonBuffer = point_cJson_handler(post_data);
+    if (rt_memcmp(cJsonBuffer, STR_ERROR, rt_strlen(STR_ERROR)) == 0)
+    {
+        wayz_error("location No wifi, GNSS, cellulars signal data");
+        result = RT_ERROR;
+        goto _url_fail;
+    }
+
     buffer = wayz_webclient_post_data(url, cJsonBuffer);
     if (rt_memcmp(buffer, STR_ERROR, rt_strlen(STR_ERROR)) == 0)
     {
         rt_kprintf("\033[31;22m[E/wayz]: visiting %s failure\033[0m\r\n", url);
         result = RT_ERROR;
-        goto _url_fail;
+        goto _visit_fail;
     }
 
     result = RT_EOK;
@@ -775,11 +854,12 @@ char get_position_info(twifi_info *wlan_info, char *key, tlocation_info *locatio
     rt_free(buffer);
     buffer = RT_NULL;
 
+_visit_fail:
+    rt_free(cJsonBuffer);
+    cJsonBuffer = RT_NULL;
 _url_fail:
     rt_free(url);
-    rt_free(cJsonBuffer);
     url = RT_NULL;
-    cJsonBuffer = RT_NULL;
 _malloc_fail:
 
 #ifdef FINSH_USING_MSH

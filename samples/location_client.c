@@ -49,7 +49,8 @@ static void location_client_entry(void *parament)
     }
 
     tlocation_info location = {0};
-    ret = get_position_info(wlan_info, ACCESS_KEY, &location); // 单词定位结果获取
+
+    ret = get_position_info(wlan_info, ACCESS_KEY, RT_NULL, &location); 
     if (RT_ERROR == ret)
     {
         rt_kprintf("\033[31;22mthe device failed to obtain latitude and longitude information.\033[0m\n");
@@ -61,7 +62,7 @@ static void location_client_entry(void *parament)
     
     while (1)
     {
-        ret = get_position_info(wlan_info, ACCESS_KEY, &location); // 单词定位结果获取
+        ret = get_position_info(wlan_info, ACCESS_KEY, RT_NULL, &location); 
         if (RT_ERROR == ret)
         {
             rt_kprintf("\033[31;22mthe device failed to obtain latitude and longitude information.\033[0m\n");

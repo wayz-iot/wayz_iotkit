@@ -30,7 +30,7 @@ RT-Thread online packages
 - 注：wifi 名字和密码 供软件包切换模式用
 
 ## 工作原理
-设备中wifi模块获取周围环境中的wifi信息，组包通过http方式上传到WAYZ定位云平台，云平台进行分析后将经纬度等其他信息一并返回到软件包，软件包通过处理可以得到gcj02和wgs84标准的经纬度，和POI信息
+设备中wifi模块获取周围环境中的wifi信息，组包通过http方式上传到WAYZ定位云平台，云平台进行分析后将经纬度等其他信息一并返回到软件包，软件包通过处理可以得到gcj02和wgs84标准的经纬度，和POI信息。也可以通过传入gnss、基站等相关数据获取定位结果及其POI信息
 
 ## wifi、设备相关初始化
 ```c
@@ -78,15 +78,39 @@ if (ret != DEV_REGISTER_OK)
 }
 ```
 
+## 填充GNSS、基站信息定位
+```c
+typedef struct _gnss_unit_
+{
+    uint64_t timestamp;         // 数据收集的时间戳（UTC 时间，单位：毫秒）
+    double lng;                 // 经度
+    double lat;                 // 纬度 
+    float accuracy;             // 卫星定位水平精度，单位：米
+}tgnss_unit;
+
+typedef struct _cell_unit_
+{
+    uint64_t timestamp;         // 数据收集的时间戳（UTC 时间，单位：毫秒）
+    uint32_t cellId;            // 小区 ID，当 CDMA 时，为 BID（Base Station ID）
+    char radio_type[7];         // 基站类型，只能是以下值：gsm, wcdma, lte, cdma
+    uint32_t mcc;               // mobileCountryCode：MCC 码
+    uint32_t mnc;               // mobileNetworkCode：当 CDMA 时，为 SID（System ID）码
+    uint32_t lac;               // locationAreaCode：当 CDMA 时，为 NID（Network ID）；
+                                                     当 LTE 时，为 TAC（Tracking Area code）
+}tcell_unit;
+```
+通过填充GNSS、基站等数据，传入定位接口即可获取定位结果信息
+
+
 ## 获取定位结果
 
-应用程序使用`get_position_info`函数从平台端获取位置信息。
+应用程序使用`get_position_info`函数从平台端获取位置信息。**其中ACCESS_KEY需要在平台上申请**
 `location_print`函数是打印位置相关信息
 
 示例代码如下所示：
 ```c
 tlocation_info location = {0};
-ret = get_position_info(wlan_info, ACCESS_KEY, &location); 
+ret = get_position_info(wlan_info, ACCESS_KEY, RT_NULL, &location); 
 if (RT_ERROR == ret)
 {
     rt_kprintf("\033[31;22mthe device failed to obtain latitude and longitude information.\033[0m\n");
@@ -96,6 +120,7 @@ else
     location_print(location);
 }
 ```
+- 其中`get_position_info`函数第三个参数为填充的`GNSS和基站数据`，相关操作可以参照[示例文档](docs/samples.md)
 
 **打印位置信息结果**
 ```c
@@ -119,7 +144,7 @@ POI: {"id": "7SkEZdfXQfS","type": "Residential","name": "中建东湖明珠国�
 ```c
 while (1)
 {
-    ret = get_position_info(wlan_info, ACCESS_KEY, &location); 
+    ret = get_position_info(wlan_info, ACCESS_KEY, RT_NULL, &location); 
     if (RT_ERROR == ret)
     {
         rt_kprintf("\033[31;22mthe device failed to obtain latitude and longitude information.\033[0m\n");

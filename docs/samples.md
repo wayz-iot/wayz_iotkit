@@ -37,7 +37,29 @@
 #define  TENANT         "WAYZ"		   // 设备所属租户，通常是开放平台的用户 ID
 ```
 
-## 3、在`main()`主函数调用例程
+## 3、GNSS、基站数据的填充
+
+```c
+tpost_data post_data = {0};					// 定义上传数据结构体
+
+post_data.gnss.timestamp = 1606729066000;
+post_data.gnss.lng = 114.39583641301239;
+post_data.gnss.lat = 30.51769862171484;
+post_data.gnss.accuracy = 8;
+
+post_data.cellulars.count = 1;
+post_data.cellulars.cell[0].timestamp = 1515743846504;
+post_data.cellulars.cell[0].cellId = 149833211;
+rt_sprintf(post_data.cellulars.cell[0].radio_type, "%s", "gsm");
+post_data.cellulars.cell[0].mcc = 460;
+post_data.cellulars.cell[0].mnc = 11;
+post_data.cellulars.cell[0].lac = 36558;
+
+// 传入获取定位函数中
+get_position_info(wlan_info, ACCESS_KEY, &post_data, &location); 
+```
+
+## 4、在`main()`主函数调用例程
 在将下面代码嵌入main()中，即可实现调用：
 ```c
 extern int location_client_start(void);
