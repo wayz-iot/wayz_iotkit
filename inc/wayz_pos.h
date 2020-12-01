@@ -133,7 +133,7 @@ typedef struct _gnss_unit_
 typedef struct _cell_unit_
 {
     uint64_t timestamp;
-    uint32_t cellId;
+    uint32_t cell_id;
     char radio_type[7]; // Base station type, can only be the following values: GSM, WCDMA, LTE, CDMA
     uint32_t mcc; // mobileCountryCode
     uint32_t mnc; // mobileNetworkCode

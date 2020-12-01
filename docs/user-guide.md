@@ -91,7 +91,7 @@ typedef struct _gnss_unit_
 typedef struct _cell_unit_
 {
     uint64_t timestamp;         // 数据收集的时间戳（UTC 时间，单位：毫秒）
-    uint32_t cellId;            // 小区 ID，当 CDMA 时，为 BID（Base Station ID）
+    uint32_t cell_id;           // 小区 ID，当 CDMA 时，为 BID（Base Station ID）
     char radio_type[7];         // 基站类型，只能是以下值：gsm, wcdma, lte, cdma
     uint32_t mcc;               // mobileCountryCode：MCC 码
     uint32_t mnc;               // mobileNetworkCode：当 CDMA 时，为 SID（System ID）码

@@ -49,7 +49,7 @@ post_data.gnss.accuracy = 8;
 
 post_data.cellulars.count = 1;
 post_data.cellulars.cell[0].timestamp = 1515743846504;
-post_data.cellulars.cell[0].cellId = 149833211;
+post_data.cellulars.cell[0].cell_id = 149833211;
 rt_sprintf(post_data.cellulars.cell[0].radio_type, "%s", "gsm");
 post_data.cellulars.cell[0].mcc = 460;
 post_data.cellulars.cell[0].mnc = 11;

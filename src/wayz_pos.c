@@ -388,7 +388,7 @@ static char *point_cJson_handler(tpost_data *post_data)
             {
                 cJSON_AddItemToArray(thm, fld = cJSON_CreateObject());
                 cJSON_AddNumberToObject(fld, "timestamp", post_data->cellulars.cell[i].timestamp);
-                cJSON_AddNumberToObject(fld, "cellId", post_data->cellulars.cell[i].cellId);
+                cJSON_AddNumberToObject(fld, "cellId", post_data->cellulars.cell[i].cell_id);
                 cJSON_AddStringToObject(fld, "radioType", post_data->cellulars.cell[i].radio_type);
                 cJSON_AddNumberToObject(fld, "mobileCountryCode", post_data->cellulars.cell[i].mcc);
                 cJSON_AddNumberToObject(fld, "mobileNetworkCode", post_data->cellulars.cell[i].mnc);
