@@ -117,9 +117,9 @@ typedef struct _place_info_
 
 typedef struct _location_info_
 {
+    char timestamp[20];  // When to locate the result
     tpoint_info point;
     tplace_info place;
-    uint64_t timestamp;  // When to locate the result
 }tlocation_info;
 
 typedef struct _gnss_unit_

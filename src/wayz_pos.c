@@ -153,16 +153,16 @@ static void _handler_scan_result(struct rt_wlan_scan_result *scan_result)
 
 static void get_wifi_scan_info()
 {
-    if (RT_TRUE == rt_wlan_is_connected())
-    {
-        wayz_error("ready to disconect from ap ...");
-        rt_wlan_disconnect();
-    }
-    /* wait 500 milliseconds for wifi low level initialize complete */
-    //rt_hw_wlan_wait_init_done(500);
-    /* Configuring WLAN device working mode */
-    rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_STATION);
-        /* scan ap */
+    // if (RT_TRUE == rt_wlan_is_connected())
+    // {
+    //     wayz_error("ready to disconect from ap ...");
+    //     rt_wlan_disconnect();
+    // }
+    // /* wait 500 milliseconds for wifi low level initialize complete */
+    // //rt_hw_wlan_wait_init_done(500);
+    // /* Configuring WLAN device working mode */
+    // rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_STATION);
+    /* scan ap */
     struct rt_wlan_scan_result *scan_result = RT_NULL;
     rt_kprintf("\nstart to scan ap ...\n");
     /* execute synchronous scan function */
@@ -293,7 +293,7 @@ static char wifi_init(const char *ssid, const char *password)
     }
 
 _connected:
-    rt_wlan_config_autoreconnect(RT_TRUE);
+    // rt_wlan_config_autoreconnect(RT_TRUE);
     return ret;
 }
 
@@ -428,7 +428,7 @@ static char *point_cJson_handler(tpost_data *post_data)
 void location_print(tlocation_info location)
 {
     rt_kprintf("-------------------location result-------------------------------\r\n");
-    rt_kprintf("timestamp: %lld \r\n", location.timestamp);
+    rt_kprintf("timestamp: %s ms \r\n", location.timestamp);
     printf("gcj02:\r\n\tlatitude:%f\r\n\tlongitude:%f\r\n", location.point.gcj02.latitude, location.point.gcj02.longitude);
     printf("wgs84:\r\n\tlatitude:%0.12f\r\n\tlongitude:%0.12f\r\n", location.point.wgs84.latitude, location.point.wgs84.longitude);
 
@@ -469,7 +469,8 @@ static void parse_point_cJson_handler(char *data, tlocation_info *location)
 
     item = cJSON_GetObjectItem(position, "timestamp");
     buffer = cJSON_Print(item);
-    location->timestamp = atoll(buffer);
+    rt_memset(location->timestamp, 0, sizeof (location->timestamp));
+    rt_sprintf(location->timestamp, "%s", buffer);
     rt_free(buffer);
     buffer = RT_NULL;
 
@@ -503,18 +504,21 @@ static void parse_point_cJson_handler(char *data, tlocation_info *location)
 
     item = cJSON_GetObjectItem(place, "id");
     buffer = cJSON_Print(item);
+    rt_memset(location->place.id, 0, sizeof (location->place.id));
     rt_sprintf(location->place.id , "%s", buffer);
     rt_free(buffer);
     buffer = RT_NULL;
 
     item = cJSON_GetObjectItem(place, "type");
     buffer = cJSON_Print(item);
+    rt_memset(location->place.type, 0, sizeof (location->place.type));
     rt_sprintf(location->place.type , "%s", buffer);
     rt_free(buffer);
     buffer = RT_NULL;
 
     item = cJSON_GetObjectItem(place, "name");
     buffer = cJSON_Print(item);
+    rt_memset(location->place.name, 0, sizeof (location->place.name));
     rt_sprintf(location->place.name , "%s", buffer);
     rt_free(buffer);
     buffer = RT_NULL;
@@ -524,11 +528,13 @@ static void parse_point_cJson_handler(char *data, tlocation_info *location)
     temp = cJSON_GetArrayItem(category, 0);
     item = cJSON_GetObjectItem(temp, "id");
     buffer = cJSON_Print(item);
+    rt_memset(location->place.category.id, 0, sizeof (location->place.category.id));
     rt_sprintf(location->place.category.id , "%s", buffer);
     rt_free(buffer);
     buffer = RT_NULL;
     item = cJSON_GetObjectItem(temp, "name");
     buffer = cJSON_Print(item);
+    rt_memset(location->place.category.name, 0, sizeof (location->place.category.name));
     rt_sprintf(location->place.category.name , "%s", buffer);
     rt_free(buffer);
     buffer = RT_NULL;
