@@ -59,7 +59,7 @@ static void location_client_entry(void *parament)
     {
         location_print(location);
     }
-    
+
     while (1)
     {
         ret = get_position_info(wlan_info, ACCESS_KEY, RT_NULL, &location); 
@@ -74,13 +74,12 @@ static void location_client_entry(void *parament)
         rt_thread_mdelay(POINT_FRQ);
         rt_memset(&location, 0, sizeof (location));
     }
-    
+
 }
 
 int location_client_start(void)
 {
     rt_thread_t tid;
-				//cJsonTask();
     tid = rt_thread_create("location_client", location_client_entry, RT_NULL, 6 * 1024, RT_THREAD_PRIORITY_MAX / 3 - 1, 5);
     if (tid)
     {
@@ -91,3 +90,11 @@ int location_client_start(void)
 
     return -RT_ERROR;
 }
+
+#ifdef RT_USING_FINSH
+#include <finsh.h>
+FINSH_FUNCTION_EXPORT_ALIAS(location_client_start, location_test, location client test start);
+#ifdef FINSH_USING_MSH
+MSH_CMD_EXPORT_ALIAS(location_client_start, location_test, location client test start);
+#endif
+#endif

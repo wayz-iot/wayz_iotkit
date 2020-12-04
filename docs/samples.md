@@ -59,17 +59,12 @@ post_data.cellulars.cell[0].lac = 36558;
 get_position_info(wlan_info, ACCESS_KEY, &post_data, &location); 
 ```
 
-## 4、在`main()`主函数调用例程
-在将下面代码嵌入main()中，即可实现调用：
-```c
-extern int location_client_start(void);
-location_client_start();
-```
+## 4、在`finsh`命令行中输入`location_test`命令即可调用示例代码
 
 
 ## 示例结果 ##
 ```c
-timestamp: 1606293694990 
+timestamp: 1606293694990 ms
 gcj02:
 	latitude:30.515105
 	longitude:114.401555

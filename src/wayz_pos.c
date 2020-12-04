@@ -482,19 +482,22 @@ static void parse_point_cJson_handler(char *data, tlocation_info *location)
     }
 
     item = cJSON_GetObjectItem(point, "longitude");
-    buffer = cJSON_Print(item);
-    location->point.gcj02.longitude = atof(buffer);
-    rt_free(buffer);
-    buffer = RT_NULL;
-    // printf("longitude: %s, %3.6f\r\n", cJSON_Print(item), location.point.gcj02.longitude);
-    item = cJSON_GetObjectItem(point, "latitude");
-    buffer = cJSON_Print(item);
-    location->point.gcj02.latitude = atof(buffer);
-    rt_free(buffer);
-    buffer = RT_NULL;
-  
-    gcj02towgs84(location->point.gcj02.latitude, location->point.gcj02.longitude, &location->point.wgs84.latitude, &location->point.wgs84.longitude);
-
+    if (item)
+    {
+        buffer = cJSON_Print(item);
+        location->point.gcj02.longitude = atof(buffer);
+        rt_free(buffer);
+        buffer = RT_NULL;
+        // printf("longitude: %s, %3.6f\r\n", cJSON_Print(item), location.point.gcj02.longitude);
+        item = cJSON_GetObjectItem(point, "latitude");
+        buffer = cJSON_Print(item);
+        location->point.gcj02.latitude = atof(buffer);
+        rt_free(buffer);
+        buffer = RT_NULL;
+    
+        gcj02towgs84(location->point.gcj02.latitude, location->point.gcj02.longitude, &location->point.wgs84.latitude, &location->point.wgs84.longitude);
+    }
+    
     place = cJSON_GetObjectItem(object, "place");
     if (!place)
     {
@@ -503,41 +506,62 @@ static void parse_point_cJson_handler(char *data, tlocation_info *location)
     }
 
     item = cJSON_GetObjectItem(place, "id");
-    buffer = cJSON_Print(item);
-    rt_memset(location->place.id, 0, sizeof (location->place.id));
-    rt_sprintf(location->place.id , "%s", buffer);
-    rt_free(buffer);
-    buffer = RT_NULL;
+    if (item)
+    {
+        buffer = cJSON_Print(item);
+        rt_memset(location->place.id, 0, sizeof (location->place.id));
+        rt_sprintf(location->place.id , "%s", buffer);
+        rt_free(buffer);
+        buffer = RT_NULL;
+    }
 
     item = cJSON_GetObjectItem(place, "type");
-    buffer = cJSON_Print(item);
-    rt_memset(location->place.type, 0, sizeof (location->place.type));
-    rt_sprintf(location->place.type , "%s", buffer);
-    rt_free(buffer);
-    buffer = RT_NULL;
+    if (item)
+    {
+        buffer = cJSON_Print(item);
+        rt_memset(location->place.type, 0, sizeof (location->place.type));
+        rt_sprintf(location->place.type , "%s", buffer);
+        rt_free(buffer);
+        buffer = RT_NULL;
+    }
 
     item = cJSON_GetObjectItem(place, "name");
-    buffer = cJSON_Print(item);
-    rt_memset(location->place.name, 0, sizeof (location->place.name));
-    rt_sprintf(location->place.name , "%s", buffer);
-    rt_free(buffer);
-    buffer = RT_NULL;
+    if (item)
+    {
+        buffer = cJSON_Print(item);
+        rt_memset(location->place.name, 0, sizeof (location->place.name));
+        rt_sprintf(location->place.name , "%s", buffer);
+        rt_free(buffer);
+        buffer = RT_NULL;
+    }
 
     category = cJSON_GetObjectItem(place, "categories");
-    
-    temp = cJSON_GetArrayItem(category, 0);
-    item = cJSON_GetObjectItem(temp, "id");
-    buffer = cJSON_Print(item);
-    rt_memset(location->place.category.id, 0, sizeof (location->place.category.id));
-    rt_sprintf(location->place.category.id , "%s", buffer);
-    rt_free(buffer);
-    buffer = RT_NULL;
-    item = cJSON_GetObjectItem(temp, "name");
-    buffer = cJSON_Print(item);
-    rt_memset(location->place.category.name, 0, sizeof (location->place.category.name));
-    rt_sprintf(location->place.category.name , "%s", buffer);
-    rt_free(buffer);
-    buffer = RT_NULL;
+    if (category)
+    {
+        temp = cJSON_GetArrayItem(category, 0);
+        if (temp)
+        {
+            item = cJSON_GetObjectItem(temp, "id");
+            if (item)
+            {
+                buffer = cJSON_Print(item);
+                rt_memset(location->place.category.id, 0, sizeof (location->place.category.id));
+                rt_sprintf(location->place.category.id , "%s", buffer);
+                rt_free(buffer);
+                buffer = RT_NULL;
+            }
+
+            item = cJSON_GetObjectItem(temp, "name");
+            if (item)
+            {
+                buffer = cJSON_Print(item);
+                rt_memset(location->place.category.name, 0, sizeof (location->place.category.name));
+                rt_sprintf(location->place.category.name , "%s", buffer);
+                rt_free(buffer);
+                buffer = RT_NULL;
+            }
+        }
+    }
 
 _root_fail:
     cJSON_Delete(root);
