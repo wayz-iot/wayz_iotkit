@@ -337,12 +337,13 @@ static char *point_cJson_handler(tpost_data *post_data)
     char buftemp[40] = {0};
     rt_sprintf(buftemp, "38efe26e-bcd8-"MACPRINTID, PRINT(aucApInfo.sta_mac, 0));
 
+    cJSON_AddNumberToObject(root, "timestamp", time);
     cJSON_AddItemToObject(root, "id", cJSON_CreateString(buftemp));
     cJSON_AddItemToObject(root, "asset", fmt = cJSON_CreateObject());
     rt_sprintf(macBuf, ""MACPRINT, PRINT(aucApInfo.sta_mac, 0));
     cJSON_AddItemToObject(fmt, "id", cJSON_CreateString(macBuf));
     cJSON_AddItemToObject(root, "location", img = cJSON_CreateObject());
-
+    cJSON_AddNumberToObject(img, "timestamp", time);
     // add wifis
     if (aucApInfo.count >= 4)
     {
@@ -654,7 +655,7 @@ static unsigned char * wayz_webclient_post_data(const char *URI, const char *pos
     length = webclient_request(URI, RT_NULL, post_data, &buffer);
     if (length < 0)
     {
-        rt_kprintf("\033[31;22m[E/wayz]:webclient POST request response data error.%s\033[0m\r\n", URI);
+        rt_kprintf("\033[31;22m[E/wayz]:webclient POST request response data error.\033[0m\r\n");
         web_free(buffer);
         return STR_ERROR;
     }
@@ -723,7 +724,7 @@ static rt_uint8_t register_device(tdeviec_info *dev_info)
     buffer = wayz_webclient_post_data(url, cJsonBuffer);
     if (rt_memcmp(buffer, STR_ERROR, rt_strlen(STR_ERROR)) == 0)
     {
-        rt_kprintf("\033[31;22m[E/wayz]: visiting %s failure\033[0m\r\n", url);
+        rt_kprintf("\033[31;22m[E/wayz]: visiting http failure\033[0m\r\n");
         result = RT_ERROR;
         goto _url_fail;
     }
@@ -872,7 +873,7 @@ char get_position_info(twifi_info *wlan_info, char *key, tpost_data *post_data, 
     buffer = wayz_webclient_post_data(url, cJsonBuffer);
     if (rt_memcmp(buffer, STR_ERROR, rt_strlen(STR_ERROR)) == 0)
     {
-        rt_kprintf("\033[31;22m[E/wayz]: visiting %s failure\033[0m\r\n", url);
+        rt_kprintf("\033[31;22m[E/wayz]: visiting http failure\033[0m\r\n");
         result = RT_ERROR;
         goto _visit_fail;
     }
