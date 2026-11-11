@@ -27,7 +27,22 @@
 #define  SEGMEMTATION        5       /* 单位：MHz */
 
 #define  MAC_COUNT           6
-#define  TIMESTAMP_DEL       (1605668910969)   /* ll, NTP 失败时的兜底时间戳 */
+#define  TIMESTAMP_DEL       (1605668910969LL) /* 无系统时钟时的兜底时间戳(UTC 毫秒) */
+
+/**
+ * 组件返回码
+ *
+ * 成功返回 RT_EOK(0), 失败返回下列负值。
+ * WAYZ_ERR_PARAM 与 RT_ERROR 同值(-1), 因此原有的 `!= RT_EOK` 判断依然有效。
+ */
+#define  WAYZ_ERR_PARAM        (-1)  /* RT_ERROR: 参数非法 */
+#define  WAYZ_ERR_NET          (-2)  /* 网络 / DNS / TLS 失败 */
+#define  WAYZ_ERR_AUTH         (-3)  /* 云端 401/403: access_key 无效或无权限(不可重试) */
+#define  WAYZ_ERR_RATE_LIMIT   (-4)  /* 云端 429: 触发限流, 应退避后重试 */
+#define  WAYZ_ERR_SERVER       (-5)  /* 云端 5xx: 服务端异常, 可重试 */
+#define  WAYZ_ERR_NO_SIGNAL    (-6)  /* 云端返回 200 但没有定位结果(无线信号不足) */
+#define  WAYZ_ERR_PARSE        (-7)  /* 响应格式异常 */
+#define  WAYZ_ERR_INTERNAL     (-8)  /* 内部错误(内存不足等) */
 #define  NAME_LENGTH         32
 #define  LONG_NAME_LENGTH    64      /* POI 名 / 行政区划名: 中文 UTF-8 一个字 3 字节 */
 #define  SN_LENGTH           32
@@ -70,11 +85,16 @@
 #warning "wayz_iotkit: HTTPS is enabled but no TLS component (mbedTLS/SAL) found, the connection will fail."
 #endif
 
+/*
+ * 设备注册链路已在 v1.1.0 移除(云端在收到首个轨迹点时自动建档),
+ * 下面两个枚举仅为兼容旧代码保留, 不要再使用。
+ * 注意: WIFI_CONNECT_FAIL == 0 与 RT_EOK 语义相反, 沿用它会得到相反结论。
+ */
 enum
 {
-    WIFI_CONNECT_FAIL = 0,
-    DEV_REGISTER_OK,
-    DEV_REGISTER_FAIL
+    WIFI_CONNECT_FAIL = 0,   /* @deprecated 已废弃 */
+    DEV_REGISTER_OK,         /* @deprecated 已废弃 */
+    DEV_REGISTER_FAIL        /* @deprecated 已废弃 */
 };
 
 typedef struct _ap_struct_info_

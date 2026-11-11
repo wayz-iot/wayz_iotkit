@@ -62,7 +62,10 @@
 
 #define  NET_READY_TIME_OUT       (rt_tick_from_millisecond(15 * 1000))
 #define  SCAN_WAIT_TIME_OUT       (rt_tick_from_millisecond(10 * 1000))
+#define  SCAN_DRAIN_TIME_OUT     (rt_tick_from_millisecond(1 * 1000))
 #define  URL_BUFFER_SIZE          192
+/* 早于 2020-01-01 的系统时间视为"未校准"(无 RTC 的板子或软 RTC 的默认值) */
+#define  WAYZ_TIME_MIN_VALID_SEC  1577836800ull
 
 static tapinfo aucApInfo = {0};
 static struct rt_semaphore net_ready;
@@ -103,11 +106,22 @@ static void wayz_cjson_hooks_init(void)
 static wayz_time_provider_t s_time_provider = RT_NULL;
 
 static void wayz_error(char *msg);
+static void wayz_op_lock(void);
+static void wayz_op_unlock(void);
+static void wayz_scan_lock(void);
+static void wayz_scan_unlock(void);
 
 /* 云端返回的坐标系(response_sprf), 默认 gcj02 */
 static char s_response_sprf[8] = WAYZ_SPRF_GCJ02;
-static rt_uint64_t s_base_ms = 0;            /* 无系统时钟时的基准时间 */
+
+/*
+ * 无系统时钟时的基准时间。
+ * 不能留 0 —— 否则无 RTC 的设备会上传 1970 年的时间戳(云端会拒绝或错位归档),
+ * 这里退到一个"看起来合法"的固定基准, 再叠加开机以来的 tick 增量, 保证单调递增。
+ */
+static rt_uint64_t s_base_ms = TIMESTAMP_DEL;
 static rt_uint32_t s_base_tick = 0;
+static rt_uint8_t s_base_warned = 0;
 
 /**
  * 默认时间戳提供者: 优先取系统时钟(gettimeofday), 否则用"基准时间 + tick 增量"
@@ -116,10 +130,22 @@ static int wayz_default_time_provider(rt_uint64_t *timestamp_ms)
 {
     struct timeval tv;
 
-    if (0 == gettimeofday(&tv, RT_NULL))
+    /*
+     * gettimeofday 在没有 RTC 的板子上会直接失败(返回 -1),
+     * 未校时的软 RTC 也会给出一个很早的默认时间, 两者都视为"没有可用时钟"。
+     */
+    if ((0 == gettimeofday(&tv, RT_NULL)) &&
+        ((rt_uint64_t)tv.tv_sec >= WAYZ_TIME_MIN_VALID_SEC))
     {
         *timestamp_ms = (rt_uint64_t)tv.tv_sec * 1000 + (rt_uint64_t)(tv.tv_usec / 1000);
         return RT_EOK;
+    }
+
+    if (0 == s_base_warned)
+    {
+        s_base_warned = 1;
+        wayz_error("no valid system clock, fallback to the built-in base time. "
+                   "Use wayz_set_time_provider() to provide a real time source.");
     }
 
     /* 没有系统时钟时保证时间戳单调递增 */
@@ -140,7 +166,9 @@ static int wayz_default_time_provider(rt_uint64_t *timestamp_ms)
 
 int wayz_set_time_provider(wayz_time_provider_t provider)
 {
+    wayz_op_lock();
     s_time_provider = provider;
+    wayz_op_unlock();
 
     return RT_EOK;
 }
@@ -149,7 +177,9 @@ int wayz_set_response_sprf(const char *sprf)
 {
     if (RT_NULL == sprf)
     {
+        wayz_op_lock();
         rt_snprintf(s_response_sprf, sizeof(s_response_sprf), "%s", WAYZ_SPRF_GCJ02);
+        wayz_op_unlock();
         return RT_EOK;
     }
 
@@ -161,7 +191,9 @@ int wayz_set_response_sprf(const char *sprf)
         return RT_ERROR;
     }
 
+    wayz_op_lock();
     rt_snprintf(s_response_sprf, sizeof(s_response_sprf), "%s", sprf);
+    wayz_op_unlock();
 
     return RT_EOK;
 }
@@ -322,6 +354,21 @@ static double json_number(const cJSON *item)
 }
 
 /**
+ * 取数字字段, 类型不符时返回失败(用于必填字段的校验)
+ */
+static int json_number_ok(const cJSON *item, double *out)
+{
+    if (RT_NULL == item || item->type != cJSON_Number)
+    {
+        return RT_ERROR;
+    }
+
+    *out = item->valuedouble;
+
+    return RT_EOK;
+}
+
+/**
  * 64 位整数转十进制字符串
  *
  * 部分 RT-Thread 的 klibc vsnprintf 不支持 "%lld"(会原样输出格式串),
@@ -366,10 +413,59 @@ static void wayz_itoa64(char *buf, rt_size_t size, rt_int64_t value)
     buf[len] = '\0';
 }
 
+/*
+ * 两把锁:
+ *   s_scan_mutex  保护扫描结果收集区(由 WLAN 线程的回调写, 由调用线程读)
+ *   s_op_mutex    串行化整个定位流程, 并保护可配置的全局状态
+ *                 (注入的扫描结果 / 坐标系 / 时间源)
+ * 注意: 绝不能在等待扫描完成的期间持有 s_op_mutex, 回调会因此阻塞。
+ */
+static struct rt_mutex s_scan_mutex_obj;
+static struct rt_mutex s_op_mutex_obj;
+static rt_mutex_t s_scan_mutex;
+static rt_mutex_t s_op_mutex;
+
+static int wayz_lock_init(void)
+{
+    /*
+     * 静态互斥量: RT-Thread 的 rt_mutex_init 接收 rt_mutex_t(指针),
+     * 且只能在线程上下文调用 —— 组件初始化阶段(init 线程)满足该条件。
+     */
+    rt_mutex_init((rt_mutex_t)&s_scan_mutex_obj, "wayz_scan", RT_IPC_FLAG_PRIO);
+    rt_mutex_init((rt_mutex_t)&s_op_mutex_obj, "wayz_op", RT_IPC_FLAG_PRIO);
+    s_scan_mutex = (rt_mutex_t)&s_scan_mutex_obj;
+    s_op_mutex = (rt_mutex_t)&s_op_mutex_obj;
+
+    return RT_EOK;
+}
+INIT_COMPONENT_EXPORT(wayz_lock_init);
+
+static void wayz_op_lock(void)
+{
+    rt_mutex_take(s_op_mutex, RT_WAITING_FOREVER);
+}
+
+static void wayz_op_unlock(void)
+{
+    rt_mutex_release(s_op_mutex);
+}
+
+static void wayz_scan_lock(void)
+{
+    rt_mutex_take(s_scan_mutex, RT_WAITING_FOREVER);
+}
+
+static void wayz_scan_unlock(void)
+{
+    rt_mutex_release(s_scan_mutex);
+}
+
 #if WAYZ_USE_WLAN
 static tapinfo scan_ctx = {0};              /* 扫描结果收集区 */
 static struct rt_semaphore scan_sem;
 static rt_uint8_t scan_sem_ready = 0;
+
+
 
 /**
  * 扫描结果上报回调。
@@ -386,16 +482,18 @@ static void scan_report_handler(int event, struct rt_wlan_buff *buff, void *para
         return;
     }
 
-    if (scan_ctx.count >= AP_MAX_NUMBER)
-    {
-        return;
-    }
-
     info = (struct rt_wlan_info *)buff->data;
-    rt_memcpy(scan_ctx.tinfoAp[scan_ctx.count].mac, info->bssid, MAC_COUNT);
-    scan_ctx.tinfoAp[scan_ctx.count].rssi = (rt_int8_t)info->rssi;
-    scan_ctx.tinfoAp[scan_ctx.count].channel = (rt_uint8_t)info->channel;
-    scan_ctx.count++;
+
+    wayz_scan_lock();
+    if (scan_ctx.count < AP_MAX_NUMBER)
+    {
+        rt_memcpy(scan_ctx.tinfoAp[scan_ctx.count].mac, info->bssid, MAC_COUNT);
+        scan_ctx.tinfoAp[scan_ctx.count].rssi = (rt_int8_t)info->rssi;
+        /* 驱动的无效信道是 -1, 转成无符号会变成 255, 这里直接丢弃 */
+        scan_ctx.tinfoAp[scan_ctx.count].channel = (info->channel > 0) ? (rt_uint8_t)info->channel : 0;
+        scan_ctx.count++;
+    }
+    wayz_scan_unlock();
 }
 
 static void scan_done_handler(int event, struct rt_wlan_buff *buff, void *parameter)
@@ -420,7 +518,9 @@ static int wayz_wlan_scan(tapinfo *out)
 {
     rt_err_t err;
 
+    wayz_scan_lock();
     rt_memset(&scan_ctx, 0, sizeof(scan_ctx));
+    wayz_scan_unlock();
 
     if (0 == scan_sem_ready)
     {
@@ -443,6 +543,13 @@ static int wayz_wlan_scan(tapinfo *out)
         {
             wayz_error("wifi scan timeout.");
             err = RT_ERROR;
+
+            /*
+             * 上一次扫描超时后, 迟到的"扫描完成"事件可能落到下一次扫描的等待窗口里,
+             * 让下一次扫描被提前唤醒并返回不完整的结果(AP 不足却当成成功)。
+             * 这里在注销回调前先消费掉可能迟到的完成事件。
+             */
+            rt_sem_take(&scan_sem, SCAN_DRAIN_TIME_OUT);
         }
     }
     else
@@ -458,7 +565,9 @@ static int wayz_wlan_scan(tapinfo *out)
     rt_wlan_scan_result_clean();
 #endif
 
+    wayz_scan_lock();
     *out = scan_ctx;
+    wayz_scan_unlock();
 
     return (RT_EOK == err) ? RT_EOK : RT_ERROR;
 }
@@ -494,6 +603,7 @@ static void get_wifi_scan_info(void)
     /* 注入模式: 仿真与单元测试使用, 不访问 WiFi 硬件 */
     if (s_scan_injected)
     {
+        wayz_op_lock();
         aucApInfo = s_injected_ap;
         /* 注入数据里带了设备 MAC 时一并采用(无 WiFi 芯片时取不到真实 MAC) */
         for (i = 0; i < MAC_COUNT; i++)
@@ -547,8 +657,10 @@ int wayz_set_scan_result(const tapinfo *ap_info)
 {
     if (RT_NULL == ap_info)
     {
+        wayz_op_lock();
         rt_memset(&s_injected_ap, 0, sizeof(s_injected_ap));
         s_scan_injected = 0;
+        wayz_op_unlock();
         rt_kprintf("scan result injection disabled\n");
         return RT_EOK;
     }
@@ -559,8 +671,10 @@ int wayz_set_scan_result(const tapinfo *ap_info)
         return RT_ERROR;
     }
 
+    wayz_op_lock();
     s_injected_ap = *ap_info;
     s_scan_injected = 1;
+    wayz_op_unlock();
     rt_kprintf("scan result injection enabled, %d ap(s)\n", s_injected_ap.count);
 
     return RT_EOK;
@@ -695,9 +809,73 @@ static int wifi_init(const char *ssid, const char *password)
 #endif /* WAYZ_USE_WLAN */
 }
 
+/**
+ * 基站类型归一
+ *
+ * 云端只接受 gsm / wcdma / lte / cdma / nr(小写)。
+ * 传入大写或非法值时返回空串, 由调用方决定是否省略该字段。
+ */
+static void wayz_normalize_radio_type(const char *type, char *out, rt_size_t size)
+{
+    static const char *valid[] = { "gsm", "wcdma", "lte", "cdma", "nr" };
+    rt_size_t i, len;
+
+    if (RT_NULL == out || 0 == size)
+    {
+        return;
+    }
+    out[0] = '\0';
+
+    if (RT_NULL == type)
+    {
+        return;
+    }
+
+    len = rt_strlen(type);
+    if (len >= size)
+    {
+        len = size - 1;
+    }
+    for (i = 0; i < len; i++)
+    {
+        char c = type[i];
+
+        out[i] = ((c >= 'A') && (c <= 'Z')) ? (char)(c - 'A' + 'a') : c;
+    }
+    out[len] = '\0';
+
+    for (i = 0; i < sizeof(valid) / sizeof(valid[0]); i++)
+    {
+        if (0 == rt_strcmp(out, valid[i]))
+        {
+            return;
+        }
+    }
+
+    /* 不在白名单内 */
+    out[0] = '\0';
+}
+
+/**
+ * 信道 -> 中心频率(MHz)
+ *
+ * 2.4GHz: 2412 + (ch - 1) * 5
+ * 5GHz:   5000 + ch * 5
+ * 其它(6GHz/未知)不做换算, 返回 0 表示无效。
+ */
 static rt_uint16_t chnTofreq(rt_uint8_t channel)
 {
-    return (FREQ_START + (channel - 1) * SEGMEMTATION);
+    if ((channel >= 1) && (channel <= 14))
+    {
+        return (FREQ_START + (channel - 1) * SEGMEMTATION);
+    }
+
+    if ((channel >= 32) && (channel <= 165))
+    {
+        return (5000 + (rt_uint16_t)channel * 5);
+    }
+
+    return 0;
 }
 
 /**
@@ -753,26 +931,53 @@ static char *point_cJson_handler(const tpost_data *post_data)
     /* add wifis: 云端要求 4 ~ 10 个 */
     if (aucApInfo.count >= AP_MIN_UPLOAD)
     {
-        wifi_count = aucApInfo.count;
-        if (wifi_count > AP_MAX_UPLOAD)
+        rt_uint8_t order[AP_MAX_NUMBER];
+        rt_uint8_t n = aucApInfo.count;
+
+        /*
+         * 云端文档建议"提供至少 10 个 WiFi 信息以确保定位成功率",
+         * 因此按信号强度从强到弱排序, 取前 AP_MAX_UPLOAD 个,
+         * 而不是简单取扫描顺序的前 N 个(驱动返回的顺序通常不是按强度排的)。
+         * 注意: RSSI 是负值, 越接近 0 越强, 所以按 rssi 降序排,
+         *       不能按 abs(rssi) 排(那会把最弱的排到最前)。
+         */
+        for (i = 0; i < n; i++)
         {
-            wifi_count = AP_MAX_UPLOAD;
+            order[i] = i;
         }
+        for (i = 1; i < n; i++)
+        {
+            rt_uint8_t key = order[i];
+            int key_rssi = (int)aucApInfo.tinfoAp[key].rssi;
+            int j = i;
+
+            while ((j > 0) && ((int)aucApInfo.tinfoAp[order[j - 1]].rssi < key_rssi))
+            {
+                order[j] = order[j - 1];
+                j--;
+            }
+            order[j] = key;
+        }
+
+        wifi_count = (n > AP_MAX_UPLOAD) ? AP_MAX_UPLOAD : n;
 
         cJSON_AddItemToObject(img, "wifis", thm = cJSON_CreateArray());
         for (i = 0; i < wifi_count; i++)
         {
+            const tapStructInfo *ap = &aucApInfo.tinfoAp[order[i]];
+            rt_uint16_t freq = chnTofreq(ap->channel);
+
             cJSON_AddItemToArray(thm, fld = cJSON_CreateObject());
-            rt_snprintf(macBuf, sizeof(macBuf), ""MACPRINT, PRINT(aucApInfo.tinfoAp[i].mac, 0));
+            rt_snprintf(macBuf, sizeof(macBuf), ""MACPRINT, PRINT(ap->mac, 0));
             cJSON_AddStringToObject(fld, "macAddress", macBuf);
             cJSON_AddNumberToObject(fld, "timestamp", (double)time);
-            cJSON_AddNumberToObject(fld, "signalStrength", abs((int)aucApInfo.tinfoAp[i].rssi));
-            if (aucApInfo.tinfoAp[i].channel > 0)
+            cJSON_AddNumberToObject(fld, "signalStrength", abs((int)ap->rssi));
+            if ((ap->channel > 0) && (0 != freq))
             {
-                cJSON_AddNumberToObject(fld, "channel", aucApInfo.tinfoAp[i].channel);
-                cJSON_AddNumberToObject(fld, "frequency", chnTofreq(aucApInfo.tinfoAp[i].channel));
+                cJSON_AddNumberToObject(fld, "channel", ap->channel);
+                cJSON_AddNumberToObject(fld, "frequency", freq);
             }
-            cJSON_AddBoolToObject(fld, "connected", ap_is_connected(aucApInfo.tinfoAp[i].mac));
+            cJSON_AddBoolToObject(fld, "connected", ap_is_connected(ap->mac));
         }
         state = 1;
     }
@@ -803,14 +1008,21 @@ static char *point_cJson_handler(const tpost_data *post_data)
 
             for (i = 0; i < post_data->cellulars.count && i < CELL_COUNT; i ++)
             {
+                char radio[8] = {0};
+
                 cJSON_AddItemToArray(thm, fld = cJSON_CreateObject());
                 cJSON_AddNumberToObject(fld, "timestamp", (double)post_data->cellulars.cell[i].timestamp);
                 cJSON_AddNumberToObject(fld, "cellId", post_data->cellulars.cell[i].cell_id);
-                cJSON_AddStringToObject(fld, "radioType", post_data->cellulars.cell[i].radio_type);
+                wayz_normalize_radio_type(post_data->cellulars.cell[i].radio_type, radio, sizeof(radio));
+                if ('\0' != radio[0])
+                {
+                    cJSON_AddStringToObject(fld, "radioType", radio);
+                }
                 cJSON_AddNumberToObject(fld, "mobileCountryCode", post_data->cellulars.cell[i].mcc);
                 cJSON_AddNumberToObject(fld, "mobileNetworkCode", post_data->cellulars.cell[i].mnc);
                 cJSON_AddNumberToObject(fld, "locationAreaCode", post_data->cellulars.cell[i].lac);
-                cJSON_AddNumberToObject(fld, "signalStrength", post_data->cellulars.cell[i].signal_strength);
+                /* 云端要求取信号强度的绝对值 */
+                cJSON_AddNumberToObject(fld, "signalStrength", abs((int)post_data->cellulars.cell[i].signal_strength));
                 cJSON_AddBoolToObject(fld, "connected", post_data->cellulars.cell[i].connected);
             }
             state = 1;
@@ -981,20 +1193,27 @@ static int parse_point_cJson_handler(const char *data, tlocation_info *location)
 
     if (RT_NULL == data || RT_NULL == location)
     {
-        return RT_ERROR;
+        return WAYZ_ERR_PARAM;
     }
+
+    /*
+     * 输出结构体完全由本函数填充: 先清零, 避免上一次调用的残留
+     * (POI/地址/行政区划) 被当成本次结果返回。
+     */
+    rt_memset(location, 0, sizeof(*location));
 
     root = cJSON_Parse(data);
     if (RT_NULL == root)
     {
         rt_kprintf("\033[31;22m[E/wayz]Error before: [%s]\033[0m\n", cJSON_GetErrorPtr());
-        return RT_ERROR;
+        return WAYZ_ERR_PARSE;
     }
 
     object = cJSON_GetObjectItem(root, "location");
     if (RT_NULL == object)
     {
         wayz_error("location failure\r\n");
+        rc = WAYZ_ERR_NO_SIGNAL;
         goto __exit;
     }
 
@@ -1006,14 +1225,20 @@ static int parse_point_cJson_handler(const char *data, tlocation_info *location)
          * 例如使用未经定位库收录的 AP 时就是这个结果。
          */
         wayz_error("the cloud did not return a position, maybe the wifi signal is not enough.\r\n");
+        rc = WAYZ_ERR_NO_SIGNAL;
         goto __exit;
     }
 
     item = cJSON_GetObjectItem(position, "timestamp");
     if (RT_NULL != item)
     {
-        wayz_itoa64(location->timestamp, sizeof(location->timestamp),
-                    (rt_int64_t)json_number(item));
+        double ts = json_number(item);
+
+        /* double -> int64 的越界转换是未定义行为, 先做范围检查 */
+        if ((ts > -9.0e18) && (ts < 9.0e18))
+        {
+            wayz_itoa64(location->timestamp, sizeof(location->timestamp), (rt_int64_t)ts);
+        }
     }
 
     item = cJSON_GetObjectItem(position, "source");
@@ -1032,17 +1257,43 @@ static int parse_point_cJson_handler(const char *data, tlocation_info *location)
     if (RT_NULL == point)
     {
         wayz_error("point failure\r\n");
+        rc = WAYZ_ERR_PARSE;
         goto __exit;
     }
 
     /*
      * 坐标由云端按请求参数 response_sprf 给出(坐标系见 spatial_reference),
      * 组件不做本地坐标换算。
+     * 经纬度是必填项: 缺失或类型不符时必须报错, 不能默默当成 (0,0) 的有效定位。
      */
-    item = cJSON_GetObjectItem(point, "longitude");
-    location->point.longitude = json_number(item);
-    item = cJSON_GetObjectItem(point, "latitude");
-    location->point.latitude = json_number(item);
+    {
+        double lng = 0.0, lat = 0.0;
+
+        if ((RT_EOK != json_number_ok(cJSON_GetObjectItem(point, "longitude"), &lng)) ||
+            (RT_EOK != json_number_ok(cJSON_GetObjectItem(point, "latitude"), &lat)))
+        {
+            wayz_error("the position has no valid longitude/latitude.\r\n");
+            rc = WAYZ_ERR_PARSE;
+            goto __exit;
+        }
+
+        if ((lng > 180.0) || (lng < -180.0) || (lat > 90.0) || (lat < -90.0))
+        {
+            wayz_error("the position longitude/latitude is out of range.\r\n");
+            rc = WAYZ_ERR_PARSE;
+            goto __exit;
+        }
+
+        if ((0.0 == lng) && (0.0 == lat))
+        {
+            wayz_error("the position is (0, 0), treat it as invalid.\r\n");
+            rc = WAYZ_ERR_PARSE;
+            goto __exit;
+        }
+
+        location->point.longitude = lng;
+        location->point.latitude = lat;
+    }
 
     place = cJSON_GetObjectItem(object, "place");
     if (RT_NULL != place)
@@ -1124,8 +1375,86 @@ __exit:
  *          printf is ok
  *
 */
+/**
+ * 把 double 格式化成定点字符串(保留 6 位小数)
+ *
+ * 不使用 libc printf 的 %f:
+ *   - RT-Thread 自带的 libc(klibc)不支持浮点格式化, 会原样打印 "%f";
+ *   - libc printf 只在链了 newlib 的 BSP 上存在, 且默认不接 RT-Thread 控制台,
+ *     经纬度会打印不到串口上; 不带 newlib 的 BSP 还会链接失败。
+ *
+ * @param value  待格式化的数值
+ * @param buf    输出缓冲
+ * @param size   缓冲大小
+ */
+static void wayz_fmt_fixed6(double value, char *buf, rt_size_t size)
+{
+    rt_uint64_t ip, fp;
+    char ip_digits[24];
+    int ip_len = 0;
+    int i;
+    rt_size_t out = 0;
+    int neg = 0;
+
+    if (RT_NULL == buf || 0 == size)
+    {
+        return;
+    }
+    buf[0] = '\0';
+
+    if (value < 0.0)
+    {
+        neg = 1;
+        value = -value;
+    }
+    if (!(value < 1.0e12))
+    {
+        value = 0.0;
+    }
+
+    ip = (rt_uint64_t)value;
+    fp = (rt_uint64_t)((value - (double)ip) * 1000000.0 + 0.5);
+    if (fp > 999999)
+    {
+        fp = 999999;
+    }
+
+    do
+    {
+        ip_digits[ip_len++] = (char)('0' + (ip % 10));
+        ip /= 10;
+    } while ((ip > 0) && (ip_len < (int)sizeof(ip_digits)));
+
+    if (neg && (out + 1 < size))
+    {
+        buf[out++] = '-';
+    }
+    for (i = ip_len - 1; i >= 0; i--)
+    {
+        if (out + 1 < size)
+        {
+            buf[out++] = ip_digits[i];
+        }
+    }
+
+    if (out + 7 < size)
+    {
+        buf[out++] = '.';
+        buf[out++] = (char)('0' + (fp / 100000));
+        buf[out++] = (char)('0' + ((fp / 10000) % 10));
+        buf[out++] = (char)('0' + ((fp / 1000) % 10));
+        buf[out++] = (char)('0' + ((fp / 100) % 10));
+        buf[out++] = (char)('0' + ((fp / 10) % 10));
+        buf[out++] = (char)('0' + (fp % 10));
+    }
+
+    buf[out] = '\0';
+}
+
 void location_print(const tlocation_info *location)
 {
+    char lat_buf[32] = {0};
+    char lng_buf[32] = {0};
     int i;
 
     if (RT_NULL == location)
@@ -1133,11 +1462,13 @@ void location_print(const tlocation_info *location)
         return;
     }
 
+    wayz_fmt_fixed6(location->point.latitude, lat_buf, sizeof(lat_buf));
+    wayz_fmt_fixed6(location->point.longitude, lng_buf, sizeof(lng_buf));
+
     rt_kprintf("-------------------location result-------------------------------\r\n");
     rt_kprintf("timestamp: %s ms \r\n", location->timestamp);
-    printf("point(%s):\r\n\tlatitude:%f\r\n\tlongitude:%f\r\n",
-           location->spatial_reference,
-           location->point.latitude, location->point.longitude);
+    rt_kprintf("point(%s):\r\n\tlatitude:%s\r\n\tlongitude:%s\r\n",
+               location->spatial_reference, lat_buf, lng_buf);
     rt_kprintf("accuracy: %d m\r\n", (int)location->accuracy);
     rt_kprintf("source: %s, spatialReference: %s\r\n",
                location->source, location->spatial_reference);
@@ -1184,6 +1515,62 @@ static int wayz_key_check(const char *key)
 
 
 /**
+ * 按 HTTP 状态码给出错误码, 便于上层区分"可重试"与"必须换密钥"
+ */
+static int wayz_status_to_error(int status)
+{
+    switch (status)
+    {
+    case 400:
+    case 404:
+        return WAYZ_ERR_PARAM;
+    case 401:
+    case 403:
+        return WAYZ_ERR_AUTH;
+    case 429:
+        return WAYZ_ERR_RATE_LIMIT;
+    default:
+        break;
+    }
+
+    if (status >= 500)
+    {
+        return WAYZ_ERR_SERVER;
+    }
+
+    return WAYZ_ERR_NET;
+}
+
+/**
+ * 打印云端返回的错误信息, 便于定位是密钥问题还是参数问题
+ */
+static void wayz_print_cloud_message(const char *body)
+{
+    cJSON *root = RT_NULL;
+    cJSON *item = RT_NULL;
+
+    if (RT_NULL == body)
+    {
+        return;
+    }
+
+    wayz_cjson_hooks_init();
+    root = cJSON_Parse(body);
+    if (RT_NULL == root)
+    {
+        return;
+    }
+
+    item = cJSON_GetObjectItem(root, "message");
+    if (RT_NULL != item && RT_NULL != item->valuestring)
+    {
+        rt_kprintf("\033[33;22m[W/wayz]: cloud says: %s\033[0m\n", item->valuestring);
+    }
+
+    cJSON_Delete(root);
+}
+
+/**
  * Get the positioning result function
  *
  * @param wlan_info Wifi related information
@@ -1192,14 +1579,14 @@ static int wayz_key_check(const char *key)
  * @param location get location result
  *
  * @return RT_EOK: success
- *         RT_ERROR: location failure
+ *         WAYZ_ERR_*: 失败, 见 inc/wayz_pos.h 的错误码说明
  */
 int wayz_connect(twifi_info *wlan_info)
 {
     if (RT_NULL == wlan_info || RT_NULL == wlan_info->ssid || RT_NULL == wlan_info->passwd)
     {
         wayz_error("the wifi info is invalid.");
-        return RT_ERROR;
+        return WAYZ_ERR_PARAM;
     }
 
     return wifi_init(wlan_info->ssid, wlan_info->passwd);
@@ -1212,45 +1599,78 @@ int get_position_info(twifi_info *wlan_info, const char *key, const tpost_data *
     unsigned char *buffer = RT_NULL;
     char *cJsonBuffer = NULL;
     int status = 0;
-    int result = RT_ERROR;
+    int result = WAYZ_ERR_INTERNAL;
+    int len = 0;
 
     if (RT_NULL == wlan_info || RT_NULL == location)
     {
         wayz_error("the wifi info or location is invalid.");
-        return RT_ERROR;
+        return WAYZ_ERR_PARAM;
     }
 
     if (RT_EOK != wayz_key_check(key))
     {
-        return RT_ERROR;
+        return WAYZ_ERR_PARAM;
     }
 
-    /* 1 scan wifi info */
-    get_wifi_scan_info();
-    /* 2 connect to the internet */
+    /*
+     * 串行化整个定位流程: 并发调用会互相覆盖扫描结果与坐标系,
+     * 且其中一个调用会抢走另一个的"扫描完成"事件。
+     * (扫描等待期间不持有 s_scan_mutex, 回调不会被阻塞)
+     */
+    wayz_op_lock();
+
+    /*
+     * 1 connect to the internet
+     * 2 scan wifi info
+     * 顺序很重要: 多数 WLAN 驱动在未关联/未连接时扫描结果为空或受限,
+     * 先联网再扫描才能拿到可用的 AP 列表。
+     */
     if (RT_ERROR == wifi_init(wlan_info->ssid, wlan_info->passwd))
     {
         wayz_error("connect to the internet failure\r\n");
+        result = WAYZ_ERR_NET;
         goto __exit;
     }
+
+    get_wifi_scan_info();
 
     /* 3 Upload data to get positioning results */
     cJsonBuffer = point_cJson_handler(post_data);
     if (RT_NULL == cJsonBuffer)
     {
         wayz_error("location No wifi, GNSS, cellulars signal data");
+        result = WAYZ_ERR_NO_SIGNAL;
         goto __exit;
     }
 
-    rt_snprintf(url, sizeof(url), "%s?response_sprf=%s&access_key=%s",
-                 wayz_track_points_url(), s_response_sprf, key);
-    if (wayz_http_request(url, cJsonBuffer, &buffer, &status) < 0)
+    len = rt_snprintf(url, sizeof(url), "%s?response_sprf=%s&access_key=%s",
+                      wayz_track_points_url(), s_response_sprf, key);
+    if ((len < 0) || ((rt_size_t)len >= sizeof(url)))
     {
-        rt_kprintf("\033[31;22m[E/wayz]: visiting http failure\033[0m\r\n");
+        wayz_error("the request url is too long.");
+        result = WAYZ_ERR_PARAM;
         goto __exit;
     }
 
-    if (RT_EOK != parse_point_cJson_handler((char *)buffer, location))
+    len = wayz_http_request(url, cJsonBuffer, &buffer, &status);
+    if (len < 0)
+    {
+        result = (status > 0) ? wayz_status_to_error(status) : WAYZ_ERR_NET;
+        rt_kprintf("\033[31;22m[E/wayz]: http request failed, status %d\033[0m\n", status);
+        goto __exit;
+    }
+
+    if (200 != status)
+    {
+        result = wayz_status_to_error(status);
+        rt_kprintf("\033[31;22m[E/wayz]: http request failed, status %d\033[0m\n", status);
+        wayz_print_cloud_message((char *)buffer);
+        goto __exit;
+    }
+
+    result = parse_point_cJson_handler((char *)buffer, location);
+    if (RT_EOK != result)
     {
         wayz_error("parse the location response failed.");
         goto __exit;
@@ -1267,6 +1687,8 @@ __exit:
     {
         rt_free(cJsonBuffer);
     }
+
+    wayz_op_unlock();
 
     return result;
 }

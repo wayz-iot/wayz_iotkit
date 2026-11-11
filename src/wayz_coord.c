@@ -7,6 +7,8 @@
  * 定位上报链路不使用本模块(云端按 response_sprf 直接返回指定坐标系),
  * 这里保留供应用侧自行换算。
  */
+#if defined(PKG_WAYZ_IOTKIT_COORD)
+
 #include "wayz_coord.h"
 
 #include <math.h>
@@ -92,3 +94,5 @@ void wayz_wgs84_to_gcj02(double wgs_lat, double wgs_lng, double *gcj_lat, double
 {
     wayz_wgs84_to_gcj02_calc(wgs_lat, wgs_lng, gcj_lat, gcj_lng);
 }
+
+#endif /* PKG_WAYZ_IOTKIT_COORD */
