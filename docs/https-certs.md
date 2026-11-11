@@ -25,7 +25,9 @@
 
 > **注意**：云端接口规定 `access_key` 放在 URL 的 query 参数里，即使走 https，密钥也仍会出现在 URL 中
 > （只是传输过程被加密）；走 http 则密钥与定位数据在链路上均为明文。
-> 组件不会把带密钥的完整 URL 打印到日志里。
+> ⚠️ 组件自身不会打印带密钥的 URL, 但 **webclient 在 https 连接失败时会把完整 URI(含 access_key)
+> 打进串口日志**(webclient.c: `LOG_E("connect failed, https client open URI(%s) failed!", URI)`),
+> 该日志级别恒开。启用 https 时请勿外传串口日志, 或给 webclient 打个日志脱敏补丁。
 
 ## 二、HTTP 的安全前提
 
