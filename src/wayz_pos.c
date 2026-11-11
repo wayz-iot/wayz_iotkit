@@ -4,23 +4,219 @@
 #include <stdio.h>
 #include <string.h>
 #include "cJSON.h"
-#include <ntp_client.h>
-#include <finsh.h>
-#include <msh.h>
 #include <math.h>
+#include <webclient.h>
+#include <sys/time.h>
 
-tapinfo aucApInfo = {0};
-static twifi_info aucwlaninfo = {0};
+/*
+ * WLAN 框架按需引入:
+ *   - RT-Thread 5.2.0 起头文件由 wlan_mgnt.h 更名为 dev_wlan_mgnt.h;
+ *   - 没有 WiFi 芯片的 BSP(仿真器 / qemu)根本不存在这两个头文件,
+ *     此时组件只能使用 wayz_set_scan_result() 注入的扫描结果。
+ */
+#if defined(PKG_WAYZ_IOTKIT_NO_WLAN)
+#  define WAYZ_USE_WLAN      0
+#elif defined(__has_include)
+#  if __has_include(<dev_wlan_mgnt.h>)
+#    include <dev_wlan_mgnt.h>
+#    define WAYZ_USE_WLAN    1
+#  elif __has_include(<wlan_mgnt.h>)
+#    include <wlan_mgnt.h>
+#    define WAYZ_USE_WLAN    1
+#  else
+#    define WAYZ_USE_WLAN    0
+#  endif
+#else
+#  include <wlan_mgnt.h>
+#  define WAYZ_USE_WLAN      1
+#endif
+
+/*
+ * RT-Thread 版本判断。RTTHREAD_VERSION 在 4.1.0 与 5.x 上都存在:
+ *   4.1.0 -> 40100, 5.0.0 -> 50000, 5.1.0 -> 50100, 5.2.0 -> 50200
+ */
+#if defined(RTTHREAD_VERSION)
+#  define WAYZ_RT_VERSION     RTTHREAD_VERSION
+#else
+#  define WAYZ_RT_VERSION     0
+#endif
+
+/* RT-Thread 5.0.0 起 WLAN 框架不再提供 rt_wlan_scan_sync()/rt_wlan_scan_result_clean() */
+#if (WAYZ_RT_VERSION >= 50000)
+#  define WAYZ_RT_5X_OR_NEWER    1
+#else
+#  define WAYZ_RT_5X_OR_NEWER    0
+#endif
+
+/*
+ * webclient 2.2.0 起 session 接口签名发生变化:
+ *   webclient_post()    增加 data_len 参数
+ *   webclient_response() 响应缓冲由 unsigned char** 改为 void**，并增加 resp_len
+ * 2.0.0 ~ 2.1.2 保持旧签名。兼容点集中在本文件这一处。
+ */
+#if defined(WEBCLIENT_SW_VERSION_NUM) && (WEBCLIENT_SW_VERSION_NUM >= 0x20200)
+#  define WAYZ_WEBCLIENT_NEW_API 1
+#else
+#  define WAYZ_WEBCLIENT_NEW_API 0
+#endif
+
+#define  NET_READY_TIME_OUT       (rt_tick_from_millisecond(15 * 1000))
+#define  SCAN_WAIT_TIME_OUT       (rt_tick_from_millisecond(10 * 1000))
+#define  URL_BUFFER_SIZE          192
+
+static tapinfo aucApInfo = {0};
 static struct rt_semaphore net_ready;
-static char access_key[KEY_LENGTH];
-#define NET_READY_TIME_OUT       (rt_tick_from_millisecond(15 * 1000))
+static rt_uint8_t sta_bssid[MAC_COUNT];      /* 当前连接 AP 的 BSSID */
+static rt_uint8_t sta_connected = 0;
+static tapinfo s_injected_ap = {0};          /* 注入的扫描结果(仿真/单测) */
+static rt_uint8_t s_scan_injected = 0;
 
-const double a = 6378245.0;
-const double ee = 0.00669342162296594323;
-const double pi = 3.14159265358979324;
+/*
+ * cJSON 默认使用 libc 的 malloc/free, 而本组件使用 RT-Thread 的堆,
+ * 两者不是同一个分配器。这里把 cJSON 的内存钩子统一到 rt_malloc/rt_free,
+ * 否则用 rt_free 释放 cJSON_Print 的结果会造成堆损坏。
+ */
+static cJSON_Hooks wayz_cjson_hooks =
+{
+    rt_malloc,
+    rt_free
+};
+
+static void wayz_cjson_hooks_init(void)
+{
+    static rt_uint8_t inited = 0;
+
+    if (inited)
+    {
+        return;
+    }
+    inited = 1;
+
+    cJSON_InitHooks(&wayz_cjson_hooks);
+}
+
+/*
+ * 时间戳提供者: 组件不自带 NTP 客户端, 时间由系统时钟提供,
+ * 需要精确校时请使用平台自带的 NTP/SNTP 组件, 或通过
+ * wayz_set_time_provider() 接入 RTC 等其它时间源。
+ */
+static wayz_time_provider_t s_time_provider = RT_NULL;
+
+static void wayz_error(char *msg);
+
+/* 云端返回的坐标系(response_sprf), 默认 gcj02 */
+static char s_response_sprf[8] = WAYZ_SPRF_GCJ02;
+static rt_uint64_t s_base_ms = 0;            /* 无系统时钟时的基准时间 */
+static rt_uint32_t s_base_tick = 0;
+
+/**
+ * 默认时间戳提供者: 优先取系统时钟(gettimeofday), 否则用"基准时间 + tick 增量"
+ */
+static int wayz_default_time_provider(rt_uint64_t *timestamp_ms)
+{
+    struct timeval tv;
+
+    if (0 == gettimeofday(&tv, RT_NULL))
+    {
+        *timestamp_ms = (rt_uint64_t)tv.tv_sec * 1000 + (rt_uint64_t)(tv.tv_usec / 1000);
+        return RT_EOK;
+    }
+
+    /* 没有系统时钟时保证时间戳单调递增 */
+    {
+        rt_uint32_t now_tick = rt_tick_get();
+        rt_uint32_t elapsed;
+
+        if (0 == s_base_tick)
+        {
+            s_base_tick = now_tick;
+        }
+        elapsed = now_tick - s_base_tick;
+        *timestamp_ms = s_base_ms + (rt_uint64_t)((rt_uint64_t)elapsed * 1000 / RT_TICK_PER_SECOND);
+    }
+
+    return RT_EOK;
+}
+
+int wayz_set_time_provider(wayz_time_provider_t provider)
+{
+    s_time_provider = provider;
+
+    return RT_EOK;
+}
+
+int wayz_set_response_sprf(const char *sprf)
+{
+    if (RT_NULL == sprf)
+    {
+        rt_snprintf(s_response_sprf, sizeof(s_response_sprf), "%s", WAYZ_SPRF_GCJ02);
+        return RT_EOK;
+    }
+
+    if ((0 != rt_strcmp(sprf, WAYZ_SPRF_GCJ02)) &&
+        (0 != rt_strcmp(sprf, WAYZ_SPRF_WGS84)) &&
+        (0 != rt_strcmp(sprf, WAYZ_SPRF_BD09)))
+    {
+        wayz_error("unsupported response_sprf, only gcj02/wgs84/bd09 are allowed.");
+        return RT_ERROR;
+    }
+
+    rt_snprintf(s_response_sprf, sizeof(s_response_sprf), "%s", sprf);
+
+    return RT_EOK;
+}
+
+/**
+ * 取 track_points 接口地址
+ *
+ * 仿真模式下允许用环境变量 WAYZ_TRACK_POINTS_URL 覆盖, 便于对接本地 mock 服务
+ * 做端到端回归(不产生任何外发流量)。
+ */
+static const char *wayz_track_points_url(void)
+{
+#ifdef PKG_WAYZ_IOTKIT_SIM
+    {
+        extern char *getenv(const char *name);
+        char *url = getenv("WAYZ_TRACK_POINTS_URL");
+
+        if (RT_NULL != url && '\0' != url[0])
+        {
+            return url;
+        }
+    }
+#endif
+
+    return DEV_POSTION_URL;
+}
+
+/**
+ * 取当前的 UTC 毫秒时间戳
+ */
+static rt_uint64_t wayz_get_timestamp_ms(void)
+{
+    rt_uint64_t timestamp = 0;
+
+    if (RT_NULL != s_time_provider)
+    {
+        if (RT_EOK == s_time_provider(&timestamp) && 0 != timestamp)
+        {
+            return timestamp;
+        }
+    }
+
+    wayz_default_time_provider(&timestamp);
+
+    return timestamp;
+}
+
 
 #define  FLOAT_EPS      1e-6
 #define  DOUBLE_EPS     1e-15
+
+static void wayz_error(char* msg)
+{
+    rt_kprintf("\033[31;22m[E/wayz]: ERROR %s\033[0m\n", msg); // Print the error message to stderr.
+}
 
 static unsigned char check_double_equal_zero(double f)
 {
@@ -46,145 +242,291 @@ static unsigned char check_float_equal_zero(float f)
     }
 }
 
-static unsigned char _outOfChina(double lat, double lon)
+/**
+ * 线程安全的字符串复制(使用 rt 堆分配器), 避免 libc strdup 与 rt_free 混用
+ */
+static char *wayz_strdup(const char *src)
 {
-    if (lon < 72.004 || lon > 137.8347)
-        return 1;
-    if (lat < 0.8293 || lat > 55.8271)
-        return 1;
-    return 0;
-}
+    rt_size_t len;
+    char *dst;
 
-static double _transformLat(double x, double y)
-{
-    double ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * sqrt(abs(x));
-    ret += (20.0 * sin(6.0 * x * pi) + 20.0 * sin(2.0 * x * pi)) * 2.0 / 3.0;
-    ret += (20.0 * sin(y * pi) + 40.0 * sin(y / 3.0 * pi)) * 2.0 / 3.0;
-    ret += (160.0 * sin(y / 12.0 * pi) + 320 * sin(y * pi / 30.0)) * 2.0 / 3.0;
-    return ret;
-}
-
-static double _transformLon(double x, double y)
-{
-    double ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * sqrt(abs(x));
-    ret += (20.0 * sin(6.0 * x * pi) + 20.0 * sin(2.0 * x * pi)) * 2.0 / 3.0;
-    ret += (20.0 * sin(x * pi) + 40.0 * sin(x / 3.0 * pi)) * 2.0 / 3.0;
-    ret += (150.0 * sin(x / 12.0 * pi) + 300.0 * sin(x / 30.0 * pi)) * 2.0 / 3.0;
-    return ret;
-}
-
-static void gps_transform( double wgLat, double wgLon, double * mgLat, double* mgLon)
-{
-    if (_outOfChina(wgLat, wgLon))
+    if (RT_NULL == src)
     {
-        *mgLat = wgLat;
-        *mgLon = wgLon;
-        return;
+        return RT_NULL;
     }
-    double dLat = _transformLat(wgLon - 105.0, wgLat - 35.0);
-    double dLon = _transformLon(wgLon - 105.0, wgLat - 35.0);
-    double radLat = wgLat / 180.0 * pi;
-    double magic = sin(radLat);
-    magic = 1 - ee * magic * magic;
-    double sqrtMagic = sqrt(magic);
-    dLat = (dLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * pi);
-    dLon = (dLon * 180.0) / (a / sqrtMagic * cos(radLat) * pi);
-    *mgLat = wgLat + dLat;
-    *mgLon = wgLon + dLon;
-};
 
-// static void wgs84togcj02(double wgLat, double wgLon, double * mgLat, double* mgLon)
-// {
-//     gps_transform(wgLat, wgLon, mgLat, mgLon);
-// }
+    len = rt_strlen(src);
+    dst = (char *)rt_calloc(1, len + 1);
+    if (RT_NULL == dst)
+    {
+        return RT_NULL;
+    }
+    rt_memcpy(dst, src, len);
 
-static void gcj02towgs84(double wgLat, double wgLon, double * mgLat, double* mgLon)
-{
-    gps_transform(wgLat, wgLon, mgLat, mgLon);
-    *mgLat = wgLat * 2 - *mgLat;
-    *mgLon = wgLon * 2 - *mgLon;
+    return dst;
 }
-
-// static void gcj02tobd09(double wgLat, double wgLon, double * mgLat, double* mgLon)
-// {
-//     double x = wgLon, y = wgLat;
-//     double z = sqrt(x * x + y * y) + 0.00002 * sin(y * pi);
-//     double theta = atan2(y, x) + 0.000003 * cos(x * pi);
-//     *mgLon = z * cos(theta) + 0.0065;
-//     *mgLat = z * sin(theta) + 0.006;
-// }
 
 /**
  * @param data: get mac address data, eg:XX:XX:XX:XX:XX:XX
- * 
- * @return 
+ * @note  调用者需保证 data 至少有 MAC_LEN(18) 字节
  */
 void get_sta_mac_addr(char *data)
 {
-    rt_uint8_t mac[6] = {0};
-    rt_wlan_get_mac(mac);
+    rt_uint8_t mac[MAC_COUNT] = {0};
 
-    rt_sprintf(data, "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
-static void wayz_error(char* msg)
-{
-    rt_kprintf("\033[31;22m[E/wayz]: ERROR %s\033[0m\n", msg); // Print the error message to stderr.
-}
-
-static void _handler_scan_result(struct rt_wlan_scan_result *scan_result)
-{
-    int index, num;
-
-    num = scan_result->num;
-    aucApInfo.count = scan_result->num;
-    for (index = 0; index < num; index ++)
+    if (RT_NULL == data)
     {
-        aucApInfo.tinfoAp[index].mac[0] = scan_result->info[index].bssid[0];
-        aucApInfo.tinfoAp[index].mac[1] = scan_result->info[index].bssid[1];
-        aucApInfo.tinfoAp[index].mac[2] = scan_result->info[index].bssid[2];
-        aucApInfo.tinfoAp[index].mac[3] = scan_result->info[index].bssid[3];
-        aucApInfo.tinfoAp[index].mac[4] = scan_result->info[index].bssid[4];
-        aucApInfo.tinfoAp[index].mac[5] = scan_result->info[index].bssid[5];
-        aucApInfo.tinfoAp[index].rssi = scan_result->info[index].rssi;
-        aucApInfo.tinfoAp[index].channel = scan_result->info[index].channel;
+        return;
     }
+
+#if WAYZ_USE_WLAN
+    rt_wlan_get_mac(mac);
+#endif
+    rt_snprintf(data, MAC_LEN, "%02x:%02x:%02x:%02x:%02x:%02x",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-static void get_wifi_scan_info()
+/**
+ * 拷贝 cJSON 字符串字段到定长缓冲区, 超长截断而不是溢出
+ */
+static void copy_json_string(char *dst, rt_size_t dst_size, const cJSON *item)
 {
-    // if (RT_TRUE == rt_wlan_is_connected())
-    // {
-    //     wayz_error("ready to disconect from ap ...");
-    //     rt_wlan_disconnect();
-    // }
-    // /* wait 500 milliseconds for wifi low level initialize complete */
-    // //rt_hw_wlan_wait_init_done(500);
-    // /* Configuring WLAN device working mode */
-    // rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_STATION);
-    /* scan ap */
-    struct rt_wlan_scan_result *scan_result = RT_NULL;
-    rt_kprintf("\nstart to scan ap ...\n");
-    /* execute synchronous scan function */
-    scan_result = rt_wlan_scan_sync();
-    if (scan_result)
+    if (RT_NULL == dst || 0 == dst_size)
     {
-        rt_kprintf("the scan is complete, results is as follows: \n");
-        /* print scan results */
-        _handler_scan_result(scan_result);
-        /* clean scan results */
-        rt_wlan_scan_result_clean();
+        return;
+    }
+
+    if (RT_NULL == item || RT_NULL == item->valuestring)
+    {
+        dst[0] = '\0';
+        return;
+    }
+
+    if (rt_strlen(item->valuestring) >= dst_size)
+    {
+        rt_kprintf("\033[33;22m[W/wayz]: the field is too long and has been truncated (%d >= %d)\033[0m\n",
+                   (int)rt_strlen(item->valuestring), (int)dst_size);
+    }
+
+    rt_snprintf(dst, dst_size, "%s", item->valuestring);
+}
+
+static double json_number(const cJSON *item)
+{
+    if (RT_NULL == item || item->type != cJSON_Number)
+    {
+        return 0.0;
+    }
+
+    return item->valuedouble;
+}
+
+/**
+ * 64 位整数转十进制字符串
+ *
+ * 部分 RT-Thread 的 klibc vsnprintf 不支持 "%lld"(会原样输出格式串),
+ * 因此这里自行转换, 保证在任何 libc 上行为一致。
+ */
+static void wayz_itoa64(char *buf, rt_size_t size, rt_int64_t value)
+{
+    char tmp[24];
+    rt_uint64_t v;
+    int i = 0;
+    rt_size_t len = 0;
+
+    if (RT_NULL == buf || 0 == size)
+    {
+        return;
+    }
+    buf[0] = '\0';
+
+    if (value < 0)
+    {
+        if (size > 1)
+        {
+            buf[len++] = '-';
+        }
+        v = (rt_uint64_t)(-(value + 1)) + 1;
     }
     else
     {
-        wayz_error("not found ap information ");
+        v = (rt_uint64_t)value;
     }
 
+    do
+    {
+        tmp[i++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while ((0 != v) && (i < (int)sizeof(tmp)));
 
+    while ((i > 0) && (len < size - 1))
+    {
+        buf[len++] = tmp[--i];
+    }
+    buf[len] = '\0';
 }
 
+#if WAYZ_USE_WLAN
+static tapinfo scan_ctx = {0};              /* 扫描结果收集区 */
+static struct rt_semaphore scan_sem;
+static rt_uint8_t scan_sem_ready = 0;
+
+/**
+ * 扫描结果上报回调。
+ * RT-Thread 4.1.0 与 5.x 的事件负载一致: buff->data 指向 struct rt_wlan_info。
+ */
+static void scan_report_handler(int event, struct rt_wlan_buff *buff, void *parameter)
+{
+    struct rt_wlan_info *info;
+
+    (void)parameter;
+
+    if (RT_WLAN_EVT_SCAN_REPORT != event || RT_NULL == buff || RT_NULL == buff->data)
+    {
+        return;
+    }
+
+    if (scan_ctx.count >= AP_MAX_NUMBER)
+    {
+        return;
+    }
+
+    info = (struct rt_wlan_info *)buff->data;
+    rt_memcpy(scan_ctx.tinfoAp[scan_ctx.count].mac, info->bssid, MAC_COUNT);
+    scan_ctx.tinfoAp[scan_ctx.count].rssi = (rt_int8_t)info->rssi;
+    scan_ctx.tinfoAp[scan_ctx.count].channel = (rt_uint8_t)info->channel;
+    scan_ctx.count++;
+}
+
+static void scan_done_handler(int event, struct rt_wlan_buff *buff, void *parameter)
+{
+    (void)buff;
+    (void)parameter;
+
+    if (RT_WLAN_EVT_SCAN_DONE == event)
+    {
+        rt_sem_release(&scan_sem);
+    }
+}
+
+/**
+ * 事件驱动的 WiFi 扫描。
+ *
+ * RT-Thread 5.0.0 起 WLAN 框架不再实现 rt_wlan_scan_sync(),
+ * 而 4.1.0 与 5.x 都提供 RT_WLAN_EVT_SCAN_REPORT / RT_WLAN_EVT_SCAN_DONE 事件,
+ * 因此统一走事件方式, 不随版本分叉。
+ */
+static int wayz_wlan_scan(tapinfo *out)
+{
+    rt_err_t err;
+
+    rt_memset(&scan_ctx, 0, sizeof(scan_ctx));
+
+    if (0 == scan_sem_ready)
+    {
+        rt_sem_init(&scan_sem, "wayz_scan", 0, RT_IPC_FLAG_FIFO);
+        scan_sem_ready = 1;
+    }
+    /* 清掉上一次扫描可能残留的信号量 */
+    while (RT_EOK == rt_sem_take(&scan_sem, 0))
+    {
+        ;
+    }
+
+    rt_wlan_register_event_handler(RT_WLAN_EVT_SCAN_REPORT, scan_report_handler, RT_NULL);
+    rt_wlan_register_event_handler(RT_WLAN_EVT_SCAN_DONE, scan_done_handler, RT_NULL);
+
+    err = rt_wlan_scan();
+    if (RT_EOK == err)
+    {
+        if (RT_EOK != rt_sem_take(&scan_sem, SCAN_WAIT_TIME_OUT))
+        {
+            wayz_error("wifi scan timeout.");
+            err = RT_ERROR;
+        }
+    }
+    else
+    {
+        wayz_error("wifi scan failed.");
+    }
+
+    rt_wlan_unregister_event_handler(RT_WLAN_EVT_SCAN_REPORT);
+    rt_wlan_unregister_event_handler(RT_WLAN_EVT_SCAN_DONE);
+
+#if !WAYZ_RT_5X_OR_NEWER
+    /* RT-Thread 4.x 在框架内部缓存了扫描结果, 需要显式释放 */
+    rt_wlan_scan_result_clean();
+#endif
+
+    *out = scan_ctx;
+
+    return (RT_EOK == err) ? RT_EOK : RT_ERROR;
+}
+#endif /* WAYZ_USE_WLAN */
+
+/**
+ * 判断扫描到的 AP 是否为当前连接的 AP
+ */
+static int ap_is_connected(const rt_uint8_t *bssid)
+{
+    int i;
+
+    if (RT_NULL == bssid || 0 == sta_connected)
+    {
+        return 0;
+    }
+
+    for (i = 0; i < MAC_COUNT; i++)
+    {
+        if (bssid[i] != sta_bssid[i])
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static void get_wifi_scan_info(void)
+{
+    int i;
+
+    /* 注入模式: 仿真与单元测试使用, 不访问 WiFi 硬件 */
+    if (s_scan_injected)
+    {
+        aucApInfo = s_injected_ap;
+        /* 注入数据里带了设备 MAC 时一并采用(无 WiFi 芯片时取不到真实 MAC) */
+        for (i = 0; i < MAC_COUNT; i++)
+        {
+            if (0 != s_injected_ap.sta_mac[i])
+            {
+                aucApInfo.sta_mac[i] = s_injected_ap.sta_mac[i];
+            }
+        }
+        rt_kprintf("using the injected scan result, %d ap(s)\n", aucApInfo.count);
+        return;
+    }
+
+#if WAYZ_USE_WLAN
+    rt_kprintf("\nstart to scan ap ...\n");
+    if (RT_EOK != wayz_wlan_scan(&aucApInfo))
+    {
+        wayz_error("not found ap information ");
+        return;
+    }
+    rt_kprintf("the scan is complete, %d ap(s) found\n", aucApInfo.count);
+#else
+    wayz_error("no wifi chip, please inject the scan result by wayz_set_scan_result().");
+#endif
+}
+
+#if WAYZ_USE_WLAN
 static void wifi_ready_handler(int event, struct rt_wlan_buff *buff, void *parameter)
 {
+    (void)event;
+    (void)buff;
+    (void)parameter;
+
     rt_sem_release(&net_ready);
 }
 
@@ -193,711 +535,738 @@ static void wifi_ready_handler(int event, struct rt_wlan_buff *buff, void *param
  */
 static void wifi_station_disconnect_handler(int event, struct rt_wlan_buff *buff, void *parameter)
 {
+    (void)event;
+    (void)buff;
+    (void)parameter;
+
     rt_kprintf("disconnect from the network!\n");
 }
+#endif /* WAYZ_USE_WLAN */
 
-// static void print_wlan_information(struct rt_wlan_info *info)
-// {
-//     rt_kprintf("SSID : %-.32s\n", &info->ssid.val[0]);
-//     rt_kprintf("MAC Addr: %02x:%02x:%02x:%02x:%02x:%02x\n", info->bssid[0],
-//                info->bssid[1],
-//                info->bssid[2],
-//                info->bssid[3],
-//                info->bssid[4],
-//                info->bssid[5]);
-//     rt_kprintf("Channel: %d\n", info->channel);
-//     rt_kprintf("DataRate: %dMbps\n", info->datarate / 1000000);
-//     rt_kprintf("RSSI: %d\n", info->rssi);
-// }
-
-twifi_info *wifi_param_init(const char *ssid, const char *passwd)
+int wayz_set_scan_result(const tapinfo *ap_info)
 {
-    twifi_info *wlan_info = (twifi_info *) rt_calloc(1, sizeof (twifi_info));
+    if (RT_NULL == ap_info)
+    {
+        rt_memset(&s_injected_ap, 0, sizeof(s_injected_ap));
+        s_scan_injected = 0;
+        rt_kprintf("scan result injection disabled\n");
+        return RT_EOK;
+    }
+
+    if (ap_info->count > AP_MAX_NUMBER)
+    {
+        wayz_error("the injected scan result is too large.");
+        return RT_ERROR;
+    }
+
+    s_injected_ap = *ap_info;
+    s_scan_injected = 1;
+    rt_kprintf("scan result injection enabled, %d ap(s)\n", s_injected_ap.count);
+
+    return RT_EOK;
+}
+
+int wifi_param_init(const char *ssid, const char *passwd, twifi_info **out)
+{
+    twifi_info *wlan_info = RT_NULL;
+
+    if (RT_NULL == out || RT_NULL == ssid || RT_NULL == passwd)
+    {
+        wayz_error("wifi param is invalid.");
+        return RT_ERROR;
+    }
+    *out = RT_NULL;
+
+    wlan_info = (twifi_info *) rt_calloc(1, sizeof (twifi_info));
     if (RT_NULL == wlan_info)
     {
         wayz_error("wifi param malloc fail.");
-        return RT_NULL;
+        return RT_ERROR;
     }
 
-    wlan_info->ssid = strdup(ssid);
-    wlan_info->passwd = strdup(passwd);
-
-    return wlan_info;
-}
-
-tdeviec_info * dev_para_init(const char *dev_name, const char *manufacturer, const char *product, \
-                const char *SN, const char *tenant)
-{
-
-    tdeviec_info *dev_info = (tdeviec_info *) rt_calloc(1, sizeof (tdeviec_info));
-    if (RT_NULL == dev_info)
+    wlan_info->ssid = wayz_strdup(ssid);
+    wlan_info->passwd = wayz_strdup(passwd);
+    if (RT_NULL == wlan_info->ssid || RT_NULL == wlan_info->passwd)
     {
-        wayz_error("wifi param malloc fail.");
-        return RT_NULL;
+        wayz_error("wifi param strdup fail.");
+        wifi_info_free(wlan_info);
+        return RT_ERROR;
     }
 
-    dev_info->dev_name = strdup(dev_name);
-    dev_info->manufacturer = strdup(manufacturer);
-    dev_info->product = strdup(product);
-    dev_info->SN = strdup(SN);
-    dev_info->tenant = strdup(tenant);
-    return dev_info;
+    *out = wlan_info;
+
+    return RT_EOK;
 }
 
-static char wifi_init(const char *ssid, const char *password)
+void wifi_info_free(twifi_info *wlan_info)
 {
+    if (RT_NULL == wlan_info)
+    {
+        return;
+    }
+
+    if (RT_NULL != wlan_info->ssid)
+    {
+        rt_free(wlan_info->ssid);
+        wlan_info->ssid = RT_NULL;
+    }
+    if (RT_NULL != wlan_info->passwd)
+    {
+        rt_free(wlan_info->passwd);
+        wlan_info->passwd = RT_NULL;
+    }
+
+    rt_free(wlan_info);
+}
+
+
+
+/**
+ * 连接路由器, 等待网络就绪
+ *
+ * @return RT_EOK: success
+ *         RT_ERROR: failed
+ */
+static int wifi_init(const char *ssid, const char *password)
+{
+#if !WAYZ_USE_WLAN
+    /*
+     * 没有 WiFi 芯片的仿真环境(如 RT-Thread 模拟器 / qemu):
+     * 宿主本身已经联网, 不需要也不能再走 WiFi 连接流程。
+     */
+    (void)ssid;
+    (void)password;
+    rt_kprintf("no wifi chip, use the host network directly.\n");
+    return RT_EOK;
+#else
     struct rt_wlan_info info;
     int result = RT_EOK;
-    char ret = RT_EOK;
-    rt_wlan_get_mac(aucApInfo.sta_mac);
 
-    rt_memcpy(aucwlaninfo.ssid, ssid, rt_strlen(ssid));
-    rt_memcpy(aucwlaninfo.passwd, password, rt_strlen(password));
+    rt_wlan_get_mac(aucApInfo.sta_mac);
 
     if (RT_TRUE == rt_wlan_is_connected())
     {
-        ret = RT_EOK;
-        goto _connected;
+        rt_memset(&info, 0, sizeof(info));
+        rt_wlan_get_info(&info);
+        rt_memcpy(sta_bssid, info.bssid, MAC_COUNT);
+        sta_connected = 1;
+        return RT_EOK;
     }
+
+    sta_connected = 0;
     rt_sem_init(&net_ready, "net_ready", 0, RT_IPC_FLAG_FIFO);
     /* register network ready event callback */
     rt_wlan_register_event_handler(RT_WLAN_EVT_READY, wifi_ready_handler, RT_NULL);
     /* register wlan disconnect event callback */
     rt_wlan_register_event_handler(RT_WLAN_EVT_STA_DISCONNECTED, wifi_station_disconnect_handler, RT_NULL);
+
     result = rt_wlan_connect(ssid, password);
-    if (result == RT_EOK)
+    if (RT_EOK == result)
     {
         rt_memset(&info, 0, sizeof(struct rt_wlan_info));
         /* Get the information of the current connection AP */
         rt_wlan_get_info(&info);
-        // rt_kprintf("station information:\n");
-        // print_wlan_information(&info);
+        rt_memcpy(sta_bssid, info.bssid, MAC_COUNT);
+        sta_connected = 1;
+
         /* waiting for IP to be got successfully  */
-        result = rt_sem_take(&net_ready, NET_READY_TIME_OUT);
-        if (result == RT_EOK)
+        if (RT_EOK != rt_sem_take(&net_ready, NET_READY_TIME_OUT))
         {
-            rt_kprintf("networking ready!\n");
+            wayz_error("wait ip got timeout!");
+            result = RT_ERROR;
         }
         else
         {
-            wayz_error("wait ip got timeout!");
+            rt_kprintf("networking ready!\n");
         }
-        /* unregister network ready event */
-        rt_wlan_unregister_event_handler(RT_WLAN_EVT_READY);
-        rt_sem_detach(&net_ready);
     }
     else
     {
         rt_kprintf("\033[31;22mThe AP(%s) is connect failed!\033[0m\n", ssid);
-        ret = RT_ERROR;
+        result = RT_ERROR;
     }
 
-_connected:
-    // rt_wlan_config_autoreconnect(RT_TRUE);
-    return ret;
+    /* 先注销事件回调再销毁信号量, 避免回调访问已销毁的信号量 */
+    rt_wlan_unregister_event_handler(RT_WLAN_EVT_READY);
+    rt_wlan_unregister_event_handler(RT_WLAN_EVT_STA_DISCONNECTED);
+    rt_sem_detach(&net_ready);
+
+    return result;
+#endif /* WAYZ_USE_WLAN */
 }
 
-// static rt_uint16_t chnTofreq(rt_uint8_t channel)
-// {
-//     return (FREQ_START + (channel - 1) * SEGMEMTATION);
-// }
-
-static char *point_cJson_handler(tpost_data *post_data)
+static rt_uint16_t chnTofreq(rt_uint8_t channel)
 {
- /* declare a few. */
+    return (FREQ_START + (channel - 1) * SEGMEMTATION);
+}
+
+/**
+ * 组装定位上报的 JSON 请求体
+ *
+ * @return 堆内存字符串(调用者负责 rt_free), 失败返回 RT_NULL
+ */
+static char *point_cJson_handler(const tpost_data *post_data)
+{
+    wayz_cjson_hooks_init();
+    /* declare a few. */
     cJSON *root = NULL;
     cJSON *fmt = NULL;
     cJSON *img = NULL;
     cJSON *thm = NULL;
     cJSON *fld = NULL;
-    int i = 0, j = 0;
+    int i = 0;
+    rt_uint8_t wifi_count = 0;
     char macBuf[MAC_LEN] = {0};
+    char idBuf[40] = {0};      /* "38efe26e-bcd8-" + 12 位十六进制 + '\0' */
     char *cJsonBuffer = NULL;
     char *buffer = NULL;
     unsigned char state = 0;
+    uint64_t time = 0;
 
     root = cJSON_CreateObject();
-
-    time_t cur_time;
-    uint64_t time = 0;
-    static uint64_t pre_time = 0;
-
-    cur_time = wayz_get_time_by_ntp(NULL);
-    if (cur_time)
+    if (RT_NULL == root)
     {
-        time = (uint64_t)cur_time * 1000;
-        // rt_kprintf("cur_time: %ld, %ld \r\n", cur_time, time);
-        pre_time = time;
+        wayz_error("create cjson object failed.");
+        return RT_NULL;
     }
-    else
-    {
-        time = (pre_time == 0 ? TIMESTAMP_DEL : (pre_time + 5000));
-    }
-    
-    char buftemp[40] = {0};
-    rt_sprintf(buftemp, "38efe26e-bcd8-"MACPRINTID, PRINT(aucApInfo.sta_mac, 0));
 
-    cJSON_AddNumberToObject(root, "timestamp", time);
-    cJSON_AddItemToObject(root, "id", cJSON_CreateString(buftemp));
+    time = wayz_get_timestamp_ms();
+    if (0 == time)
+    {
+        time = TIMESTAMP_DEL;
+    }
+
+    rt_snprintf(idBuf, sizeof(idBuf), "38efe26e-bcd8-"MACPRINTID, PRINT(aucApInfo.sta_mac, 0));
+
+    cJSON_AddNumberToObject(root, "timestamp", (double)time);
+    cJSON_AddItemToObject(root, "id", cJSON_CreateString(idBuf));
     cJSON_AddItemToObject(root, "asset", fmt = cJSON_CreateObject());
-    rt_sprintf(macBuf, ""MACPRINT, PRINT(aucApInfo.sta_mac, 0));
+    /*
+     * asset.id 必须与注册设备时使用的 id 保持一致(注册接口用的是无冒号的 MAC),
+     * 否则平台无法把这条轨迹点关联到已注册的设备。
+     */
+    rt_snprintf(macBuf, sizeof(macBuf), ""MACPRINTID, PRINT(aucApInfo.sta_mac, 0));
     cJSON_AddItemToObject(fmt, "id", cJSON_CreateString(macBuf));
     cJSON_AddItemToObject(root, "location", img = cJSON_CreateObject());
-    cJSON_AddNumberToObject(img, "timestamp", time);
-    // add wifis
-    if (aucApInfo.count >= 4)
+    cJSON_AddNumberToObject(img, "timestamp", (double)time);
+
+    /* add wifis: 云端要求 4 ~ 10 个 */
+    if (aucApInfo.count >= AP_MIN_UPLOAD)
     {
-        cJSON_AddItemToObject(img, "wifis", thm = cJSON_CreateArray());
-        for (i = 0, j = 0; i < aucApInfo.count; i++)
+        wifi_count = aucApInfo.count;
+        if (wifi_count > AP_MAX_UPLOAD)
         {
-            rt_sprintf(macBuf, ""MACPRINT, PRINT(aucApInfo.tinfoAp[i].mac, 0));
+            wifi_count = AP_MAX_UPLOAD;
+        }
+
+        cJSON_AddItemToObject(img, "wifis", thm = cJSON_CreateArray());
+        for (i = 0; i < wifi_count; i++)
+        {
             cJSON_AddItemToArray(thm, fld = cJSON_CreateObject());
+            rt_snprintf(macBuf, sizeof(macBuf), ""MACPRINT, PRINT(aucApInfo.tinfoAp[i].mac, 0));
             cJSON_AddStringToObject(fld, "macAddress", macBuf);
-            // cJSON_AddStringToObject(fld, "ssid", "");
-            // cJSON_AddNumberToObject(fld, "frequency", chnTofreq(aucApInfo.tinfoAp[i].channel));
-            cJSON_AddNumberToObject(fld, "signalStrength", abs(aucApInfo.tinfoAp[i].rssi));
-            j ++;
-            if (j > 10)
+            cJSON_AddNumberToObject(fld, "timestamp", (double)time);
+            cJSON_AddNumberToObject(fld, "signalStrength", abs((int)aucApInfo.tinfoAp[i].rssi));
+            if (aucApInfo.tinfoAp[i].channel > 0)
             {
-                //break;
+                cJSON_AddNumberToObject(fld, "channel", aucApInfo.tinfoAp[i].channel);
+                cJSON_AddNumberToObject(fld, "frequency", chnTofreq(aucApInfo.tinfoAp[i].channel));
             }
+            cJSON_AddBoolToObject(fld, "connected", ap_is_connected(aucApInfo.tinfoAp[i].mac));
         }
         state = 1;
     }
 
     if (RT_NULL != post_data)
     {
-        // add gnss
-        if (RT_EOK != check_double_equal_zero(post_data->gnss.lng) && 
+        /* add gnss */
+        if (RT_EOK != check_double_equal_zero(post_data->gnss.lng) &&
             RT_EOK != check_double_equal_zero(post_data->gnss.lat) &&
             RT_EOK != check_float_equal_zero(post_data->gnss.accuracy))
         {
             cJSON_AddItemToObject(img, "gnss", thm = cJSON_CreateObject());
-            cJSON_AddNumberToObject(thm, "timestamp", post_data->gnss.timestamp);
+            cJSON_AddNumberToObject(thm, "timestamp", (double)post_data->gnss.timestamp);
             cJSON_AddItemToObject(thm, "point", fld = cJSON_CreateObject());
             cJSON_AddNumberToObject(fld, "longitude", post_data->gnss.lng);
             cJSON_AddNumberToObject(fld, "latitude", post_data->gnss.lat);
+            if (RT_EOK != check_float_equal_zero(post_data->gnss.altitude))
+            {
+                cJSON_AddNumberToObject(fld, "altitude", post_data->gnss.altitude);
+            }
             cJSON_AddNumberToObject(thm, "accuracy", post_data->gnss.accuracy);
             state = 1;
         }
-        // add cellulars
+        /* add cellulars */
         if (0 != post_data->cellulars.count)
         {
             cJSON_AddItemToObject(img, "cellulars", thm = cJSON_CreateArray());
 
-            for (i = 0; i < post_data->cellulars.count; i ++)
+            for (i = 0; i < post_data->cellulars.count && i < CELL_COUNT; i ++)
             {
                 cJSON_AddItemToArray(thm, fld = cJSON_CreateObject());
-                cJSON_AddNumberToObject(fld, "timestamp", post_data->cellulars.cell[i].timestamp);
+                cJSON_AddNumberToObject(fld, "timestamp", (double)post_data->cellulars.cell[i].timestamp);
                 cJSON_AddNumberToObject(fld, "cellId", post_data->cellulars.cell[i].cell_id);
                 cJSON_AddStringToObject(fld, "radioType", post_data->cellulars.cell[i].radio_type);
                 cJSON_AddNumberToObject(fld, "mobileCountryCode", post_data->cellulars.cell[i].mcc);
                 cJSON_AddNumberToObject(fld, "mobileNetworkCode", post_data->cellulars.cell[i].mnc);
                 cJSON_AddNumberToObject(fld, "locationAreaCode", post_data->cellulars.cell[i].lac);
+                cJSON_AddNumberToObject(fld, "signalStrength", post_data->cellulars.cell[i].signal_strength);
+                cJSON_AddBoolToObject(fld, "connected", post_data->cellulars.cell[i].connected);
             }
             state = 1;
         }
     }
 
     cJsonBuffer = cJSON_Print(root);
-    buffer = (char *)rt_malloc(rt_strlen(cJsonBuffer));
-    if (RT_NULL == buffer)
-    {
-        wayz_error("point_cJson_handler create malloc failure.");
-        return STR_ERROR;
-    }
-
-    rt_sprintf(buffer, "%s", cJsonBuffer);
     cJSON_Delete(root);
-    rt_free(cJsonBuffer);
+    if (RT_NULL == cJsonBuffer)
+    {
+        wayz_error("print cjson failed.");
+        return RT_NULL;
+    }
 
     if (1 != state)
     {
+        rt_free(cJsonBuffer);
         wayz_error("location No wifi, GNSS, cellulars signal data");
-        return STR_ERROR;
+        return RT_NULL;
     }
+
+    buffer = (char *)rt_malloc(rt_strlen(cJsonBuffer) + 1);
+    if (RT_NULL == buffer)
+    {
+        wayz_error("point_cJson_handler create malloc failure.");
+        rt_free(cJsonBuffer);
+        return RT_NULL;
+    }
+
+    rt_snprintf(buffer, rt_strlen(cJsonBuffer) + 1, "%s", cJsonBuffer);
+    rt_free(cJsonBuffer);
+
     return buffer; // 需要free
 }
 
-/**
- * @param location: print location info
- * 
- * @warning rt_kprintf no print float/double
- *          printf is ok
- * 
-*/
-void location_print(tlocation_info location)
-{
-    rt_kprintf("-------------------location result-------------------------------\r\n");
-    rt_kprintf("timestamp: %s ms \r\n", location.timestamp);
-    printf("gcj02:\r\n\tlatitude:%f\r\n\tlongitude:%f\r\n", location.point.gcj02.latitude, location.point.gcj02.longitude);
-    printf("wgs84:\r\n\tlatitude:%0.12f\r\n\tlongitude:%0.12f\r\n", location.point.wgs84.latitude, location.point.wgs84.longitude);
 
-    rt_kprintf("POI: {\"id\": %s,\"type\": %s,\"name\": %s,\"categories\":[{\"id\": %s,\"name\": %s}]}\r\n", 
-        location.place.id, location.place.type, location.place.name, location.place.category.id, location.place.category.name);
-    rt_kprintf("-------------------location result end---------------------------\r\n");
+/**
+ * 统一的 HTTP 请求封装, 屏蔽 webclient 各版本 session 接口的差异
+ *
+ * @param url  请求地址
+ * @param body 请求体, RT_NULL 表示 GET
+ * @param resp 响应数据, 由调用者 web_free
+ * @param status HTTP 状态码
+ *
+ * @return >=0: 响应长度
+ *         <0 : 失败
+ */
+static int wayz_http_request(const char *url, const char *body, unsigned char **resp, int *status)
+{
+    struct webclient_session *session = RT_NULL;
+    int rc = -RT_ERROR;
+    int resp_len = 0;
+
+    if (RT_NULL == url || RT_NULL == resp)
+    {
+        return -RT_ERROR;
+    }
+
+    *resp = RT_NULL;
+    if (RT_NULL != status)
+    {
+        *status = 0;
+    }
+
+    session = webclient_session_create(WEBCLIENT_HEADER_BUFSZ);
+    if (RT_NULL == session)
+    {
+        wayz_error("webclient session create failed.");
+        return -RT_ERROR;
+    }
+
+    if (RT_NULL != body)
+    {
+        /*
+         * 云端要求 Content-Type: application/json,
+         * webclient 在缺失时会补 application/octet-stream 导致服务端拒收。
+         * Content-Length 需要自行添加。
+         */
+        if (webclient_header_fields_add(session, "Content-Type: application/json\r\n") < 0 ||
+            webclient_header_fields_add(session, "Content-Length: %d\r\n", rt_strlen(body)) < 0)
+        {
+            wayz_error("webclient header add failed.");
+            goto __exit;
+        }
+    }
+
+    if (RT_NULL == body)
+    {
+        rc = webclient_get(session, url);
+    }
+    else
+    {
+#if WAYZ_WEBCLIENT_NEW_API
+        rc = webclient_post(session, url, body, rt_strlen(body));
+#else
+        rc = webclient_post(session, url, body);
+#endif
+    }
+
+    if (RT_NULL != status)
+    {
+        *status = webclient_resp_status_get(session);
+    }
+
+    /* 无论状态码如何都把响应体读出来, 服务端的错误信息在 body 里 */
+#if WAYZ_WEBCLIENT_NEW_API
+    {
+        size_t len = 0;
+        resp_len = (int)webclient_response(session, (void **)resp, &len);
+    }
+#else
+    resp_len = webclient_response(session, resp);
+#endif
+
+    if (resp_len <= 0)
+    {
+        if (RT_NULL != status && 200 != *status)
+        {
+            rt_kprintf("\033[31;22m[E/wayz]: http request failed, status %d\033[0m\n", *status);
+        }
+        else
+        {
+            wayz_error("http response is empty.");
+        }
+        rc = -RT_ERROR;
+        goto __exit;
+    }
+
+    rc = resp_len;
+
+__exit:
+    if (RT_NULL != session)
+    {
+        webclient_close(session);
+    }
+
+    if (rc < 0 && RT_NULL != *resp)
+    {
+        web_free(*resp);
+        *resp = RT_NULL;
+    }
+
+    return rc;
 }
+
+
 
 /**
  * parse point cjson handler
-*/
-static void parse_point_cJson_handler(char *data, tlocation_info *location)
+ *
+ * @return RT_EOK: 解析成功
+ *         RT_ERROR: 解析失败
+ */
+static int parse_point_cJson_handler(const char *data, tlocation_info *location)
 {
-    cJSON *root, *object, *position, *point, *place, *category;
-	cJSON *item;
-	cJSON *temp = RT_NULL;
-    char *buffer = RT_NULL;
+    wayz_cjson_hooks_init();
+    cJSON *root = NULL;
+    cJSON *object = NULL;
+    cJSON *position = NULL;
+    cJSON *point = NULL;
+    cJSON *place = NULL;
+    cJSON *category = NULL;
+    cJSON *address = NULL;
+    cJSON *context = NULL;
+    cJSON *item = NULL;
+    int rc = RT_ERROR;
+    int index = 0;
+
+    if (RT_NULL == data || RT_NULL == location)
+    {
+        return RT_ERROR;
+    }
 
     root = cJSON_Parse(data);
-    if (!root) {
+    if (RT_NULL == root)
+    {
         rt_kprintf("\033[31;22m[E/wayz]Error before: [%s]\033[0m\n", cJSON_GetErrorPtr());
-        goto _root_fail;
+        return RT_ERROR;
     }
 
     object = cJSON_GetObjectItem(root, "location");
-    if (!object)
+    if (RT_NULL == object)
     {
-        wayz_error("object failure\r\n");
-        goto _root_fail;
+        wayz_error("location failure\r\n");
+        goto __exit;
     }
 
     position = cJSON_GetObjectItem(object, "position");
-    if (!position)
+    if (RT_NULL == position)
     {
-        wayz_error("position failure\r\n");
-        goto _root_fail;
+        /*
+         * 云端在无线信号不足时会接受上报但只回一个时间戳, 不返回 position。
+         * 例如使用未经定位库收录的 AP 时就是这个结果。
+         */
+        wayz_error("the cloud did not return a position, maybe the wifi signal is not enough.\r\n");
+        goto __exit;
     }
 
     item = cJSON_GetObjectItem(position, "timestamp");
-    buffer = cJSON_Print(item);
-    rt_memset(location->timestamp, 0, sizeof (location->timestamp));
-    rt_sprintf(location->timestamp, "%s", buffer);
-    rt_free(buffer);
-    buffer = RT_NULL;
+    if (RT_NULL != item)
+    {
+        wayz_itoa64(location->timestamp, sizeof(location->timestamp),
+                    (rt_int64_t)json_number(item));
+    }
+
+    item = cJSON_GetObjectItem(position, "source");
+    copy_json_string(location->source, sizeof(location->source), item);
+
+    item = cJSON_GetObjectItem(position, "spatialReference");
+    copy_json_string(location->spatial_reference, sizeof(location->spatial_reference), item);
+
+    item = cJSON_GetObjectItem(position, "accuracy");
+    if (RT_NULL != item)
+    {
+        location->accuracy = (float)json_number(item);
+    }
 
     point = cJSON_GetObjectItem(position, "point");
-    if (!point)
+    if (RT_NULL == point)
     {
         wayz_error("point failure\r\n");
-        goto _root_fail;
+        goto __exit;
     }
 
+    /*
+     * 坐标由云端按请求参数 response_sprf 给出(坐标系见 spatial_reference),
+     * 组件不做本地坐标换算。
+     */
     item = cJSON_GetObjectItem(point, "longitude");
-    if (item)
-    {
-        buffer = cJSON_Print(item);
-        location->point.gcj02.longitude = atof(buffer);
-        rt_free(buffer);
-        buffer = RT_NULL;
-        // printf("longitude: %s, %3.6f\r\n", cJSON_Print(item), location.point.gcj02.longitude);
-        item = cJSON_GetObjectItem(point, "latitude");
-        buffer = cJSON_Print(item);
-        location->point.gcj02.latitude = atof(buffer);
-        rt_free(buffer);
-        buffer = RT_NULL;
-    
-        gcj02towgs84(location->point.gcj02.latitude, location->point.gcj02.longitude, &location->point.wgs84.latitude, &location->point.wgs84.longitude);
-    }
-    
+    location->point.longitude = json_number(item);
+    item = cJSON_GetObjectItem(point, "latitude");
+    location->point.latitude = json_number(item);
+
     place = cJSON_GetObjectItem(object, "place");
-    if (!place)
+    if (RT_NULL != place)
     {
-        wayz_error("place failure\r\n");
-        goto _root_fail;
-    }
+        item = cJSON_GetObjectItem(place, "id");
+        copy_json_string(location->place.id, sizeof(location->place.id), item);
+        item = cJSON_GetObjectItem(place, "type");
+        copy_json_string(location->place.type, sizeof(location->place.type), item);
+        item = cJSON_GetObjectItem(place, "name");
+        copy_json_string(location->place.name, sizeof(location->place.name), item);
 
-    item = cJSON_GetObjectItem(place, "id");
-    if (item)
-    {
-        buffer = cJSON_Print(item);
-        rt_memset(location->place.id, 0, sizeof (location->place.id));
-        rt_sprintf(location->place.id , "%s", buffer);
-        rt_free(buffer);
-        buffer = RT_NULL;
-    }
-
-    item = cJSON_GetObjectItem(place, "type");
-    if (item)
-    {
-        buffer = cJSON_Print(item);
-        rt_memset(location->place.type, 0, sizeof (location->place.type));
-        rt_sprintf(location->place.type , "%s", buffer);
-        rt_free(buffer);
-        buffer = RT_NULL;
-    }
-
-    item = cJSON_GetObjectItem(place, "name");
-    if (item)
-    {
-        buffer = cJSON_Print(item);
-        rt_memset(location->place.name, 0, sizeof (location->place.name));
-        rt_sprintf(location->place.name , "%s", buffer);
-        rt_free(buffer);
-        buffer = RT_NULL;
-    }
-
-    category = cJSON_GetObjectItem(place, "categories");
-    if (category)
-    {
-        temp = cJSON_GetArrayItem(category, 0);
-        if (temp)
+        item = cJSON_GetObjectItem(place, "distance");
+        if (RT_NULL != item)
         {
-            item = cJSON_GetObjectItem(temp, "id");
-            if (item)
+            cJSON *line = cJSON_GetObjectItem(item, "line");
+            if (RT_NULL != line)
             {
-                buffer = cJSON_Print(item);
-                rt_memset(location->place.category.id, 0, sizeof (location->place.category.id));
-                rt_sprintf(location->place.category.id , "%s", buffer);
-                rt_free(buffer);
-                buffer = RT_NULL;
+                location->place.distance = json_number(line);
             }
+        }
 
-            item = cJSON_GetObjectItem(temp, "name");
-            if (item)
+        /* 兼容旧版本的 POI 分类信息 */
+        category = cJSON_GetObjectItem(place, "categories");
+        if (RT_NULL != category)
+        {
+            item = cJSON_GetArrayItem(category, 0);
+            if (RT_NULL != item)
             {
-                buffer = cJSON_Print(item);
-                rt_memset(location->place.category.name, 0, sizeof (location->place.category.name));
-                rt_sprintf(location->place.category.name , "%s", buffer);
-                rt_free(buffer);
-                buffer = RT_NULL;
+                cJSON *sub = cJSON_GetObjectItem(item, "id");
+                copy_json_string(location->place.category.id, sizeof(location->place.category.id), sub);
+                sub = cJSON_GetObjectItem(item, "name");
+                copy_json_string(location->place.category.name, sizeof(location->place.category.name), sub);
             }
         }
     }
 
-_root_fail:
+    address = cJSON_GetObjectItem(object, "address");
+    if (RT_NULL != address)
+    {
+        item = cJSON_GetObjectItem(address, "name");
+        copy_json_string(location->address, sizeof(location->address), item);
+
+        context = cJSON_GetObjectItem(address, "context");
+        if (RT_NULL != context)
+        {
+            cJSON *ctx_item = RT_NULL;
+
+            cJSON_ArrayForEach(ctx_item, context)
+            {
+                if (index >= CONTEXT_COUNT)
+                {
+                    break;
+                }
+
+                item = cJSON_GetObjectItem(ctx_item, "type");
+                copy_json_string(location->context[index].type, sizeof(location->context[index].type), item);
+                item = cJSON_GetObjectItem(ctx_item, "name");
+                copy_json_string(location->context[index].name, sizeof(location->context[index].name), item);
+                item = cJSON_GetObjectItem(ctx_item, "code");
+                copy_json_string(location->context[index].code, sizeof(location->context[index].code), item);
+                index++;
+            }
+            location->context_count = (rt_uint8_t)index;
+        }
+    }
+
+    rc = RT_EOK;
+
+__exit:
     cJSON_Delete(root);
-}
 
-static char * register_dev_cjson_handler(tdeviec_info *dev_info)
-{
-    cJSON *root = NULL;
-    cJSON *fmt = NULL;
-    cJSON *img = NULL;
-    char macBuf[MAC_LEN] = {0};
-    char *cJsonBuffer = NULL;
-    char *buffer = NULL;
-    time_t cur_time;
-    uint64_t time = 0;
-    static uint64_t pre_time = 0;
-    char temp[10] = {0};
-
-    root = cJSON_CreateArray();
-
-    rt_sprintf(temp, "%01d.%01d.%01d", VER_H, VER_M, VER_L);
-    rt_sprintf(macBuf, ""MACPRINTID, PRINT(aucApInfo.sta_mac, 0));
-    cJSON_AddItemToArray(root, fmt = cJSON_CreateObject());
-    cJSON_AddStringToObject(fmt, "id", macBuf);
-    cJSON_AddStringToObject(fmt, "name", dev_info->dev_name);
-    cJSON_AddStringToObject(fmt, "manufacturer", dev_info->manufacturer);
-    rt_memset(macBuf, 0, sizeof (macBuf));
-    rt_sprintf(macBuf, ""MACPRINT, PRINT(aucApInfo.sta_mac, 0));
-    cJSON_AddStringToObject(fmt, "macAddress", macBuf);
-    cJSON_AddStringToObject(fmt, "serialNumber", dev_info->SN);
-    cJSON_AddItemToObject(fmt, "firmware", img = cJSON_CreateObject());
-    cJSON_AddStringToObject(img, "version", temp);
-
-    cur_time = wayz_get_time_by_ntp(NULL);
-    if (cur_time)
-    {
-        time = (uint64_t)cur_time * 1000;
-        // rt_kprintf("cur_time: %ld, %ld \r\n", cur_time, time);
-        pre_time = time;
-    }
-    else
-    {
-        time = (pre_time == 0 ? TIMESTAMP_DEL : (pre_time + 5000));
-    }
-
-    cJSON_AddNumberToObject(fmt, "createTime", time);
-    cJSON_AddNumberToObject(fmt, "updateTime", time);
-    cJSON_AddNumberToObject(fmt, "manufactureTime", time);
-    cJSON_AddStringToObject(fmt, "product", dev_info->product);
-    cJSON_AddStringToObject(fmt, "tenant", dev_info->tenant);
-
-    cJsonBuffer = cJSON_Print(root);
-    buffer = (char *)rt_malloc(rt_strlen(cJsonBuffer));
-    if (RT_NULL == buffer)
-    {
-        rt_kprintf("create malloc failure.\r\n");
-        return STR_ERROR;
-    }
-
-    rt_sprintf(buffer, "%s", cJsonBuffer);
-
-    cJSON_Delete(root);
-    rt_free(cJsonBuffer);
-
-    return buffer; // free
-}
-
-static unsigned char * wayz_webclient_get_data(const char *URI)
-{
-    unsigned char *buffer = RT_NULL;
-    int length = 0;
-    
-    length = webclient_request(URI, RT_NULL, RT_NULL, &buffer);
-    if (length < 0)
-    {
-        wayz_error("webclient GET request response data error.");
-        web_free(buffer);
-        return STR_ERROR;
-    }
-
-    return buffer;
-}
-
-/* HTTP client upload data to server by POST request */
-static unsigned char * wayz_webclient_post_data(const char *URI, const char *post_data)
-{
-    unsigned char *buffer = RT_NULL;
-    int length = 0;
-
-    length = webclient_request(URI, RT_NULL, post_data, &buffer);
-    if (length < 0)
-    {
-        rt_kprintf("\033[31;22m[E/wayz]:webclient POST request response data error.\033[0m\r\n");
-        web_free(buffer);
-        return STR_ERROR;
-    }
-
-    return buffer;
-}
-
-static rt_uint8_t query_device()
-{
-    char *url = RT_NULL;
-    char mac_addr[MAC_LEN] = {0};
-    unsigned char *buffer = RT_NULL;
-    char *temp = RT_NULL;
-    char result = 0;
-    url = (char *)rt_malloc(rt_strlen(DEV_QUERY_URL) + MAC_LEN + rt_strlen(access_key));
-    if (RT_NULL == url)
-    {
-        result = RT_ERROR;
-        goto _malloc_fail;
-    }
-    rt_memset(url, 0, rt_strlen(DEV_QUERY_URL) + MAC_LEN + rt_strlen(access_key));
-    rt_sprintf(mac_addr, ""MACPRINTID, PRINT(aucApInfo.sta_mac, 0));
-    rt_sprintf(url, ""DEV_QUERY_URL, mac_addr, access_key);
-    buffer = wayz_webclient_get_data(url);
-    if (rt_memcmp(buffer, STR_ERROR, rt_strlen(STR_ERROR)) == 0)
-    {
-        rt_kprintf("\033[31;22m[E/wayz]: visiting %s failure\033[0m\r\n", url);
-        result = RT_ERROR;
-        goto _url_fail;
-    }
-
-    temp = rt_strstr((char *)buffer, mac_addr);
-    if (RT_NULL == temp)
-    {
-        result = RT_ERROR;
-        goto _query_fail;
-    }
-    result = RT_EOK;
-
-_query_fail:
-    rt_free(buffer);
-_url_fail:
-    rt_free(url);
-    url = RT_NULL;
-_malloc_fail:
-    return result;
-}
-
-static rt_uint8_t register_device(tdeviec_info *dev_info)
-{
-    char *url = RT_NULL;
-    unsigned char *buffer = RT_NULL;
-    char *temp = RT_NULL;
-    char result = 0;
-    char *cJsonBuffer = NULL;
-    char mac_addr[MAC_LEN] = {0};
-    url = (char *)rt_malloc(rt_strlen(DEV_REGISTER_URL) + rt_strlen(access_key));
-    if (RT_NULL == url)
-    {
-        result = RT_ERROR;
-        goto _malloc_fail;
-    }
-    rt_memset(url, 0, rt_strlen(DEV_REGISTER_URL) + rt_strlen(access_key));
-    rt_sprintf(url, ""DEV_REGISTER_URL, access_key);
-    cJsonBuffer = register_dev_cjson_handler(dev_info);
-    buffer = wayz_webclient_post_data(url, cJsonBuffer);
-    if (rt_memcmp(buffer, STR_ERROR, rt_strlen(STR_ERROR)) == 0)
-    {
-        rt_kprintf("\033[31;22m[E/wayz]: visiting http failure\033[0m\r\n");
-        result = RT_ERROR;
-        goto _url_fail;
-    }
-    rt_sprintf(mac_addr, ""MACPRINTID, PRINT(aucApInfo.sta_mac, 0));
-    temp = rt_strstr((char *)buffer, mac_addr);
-    if (RT_NULL == temp)
-    {
-        result = RT_ERROR;
-        rt_kprintf("\033[31;22m[E/wayz]: register buffer %s\033[0m\r\n", buffer);
-        goto _query_fail;
-    }
-    result = RT_EOK;
-
-_query_fail:
-    rt_free(buffer);
-    buffer = RT_NULL;
-_url_fail:
-    rt_free(url);
-    rt_free(cJsonBuffer);
-    url = RT_NULL;
-    cJsonBuffer = RT_NULL;
-_malloc_fail:
-    return result;
-}
-
-static void dev_free(tdeviec_info *dev_info)
-{
-    rt_free(dev_info->dev_name);
-    rt_free(dev_info->manufacturer);
-    rt_free(dev_info->SN);
-    rt_free(dev_info->product);
-    rt_free(dev_info->tenant);
+    return rc;
 }
 
 /**
- * Connected to the Internet to register
+ * @param location: print location info
  *
- * @param wlan_info wifi name , wifi passwd
+ * @warning rt_kprintf no print float/double
+ *          printf is ok
  *
- * @param dev_info device info ,(dev_name、manufacturer、SN[SN_LENGTH]、product[NAME_LENGTH]、tenant)
- * 
- * @param key Visiting the website key
- *
- * @return =0: wifi connect failure
- *         =1: device register success
- *         =2: device register failure
- */
-char dev_register_init(twifi_info *wlan_info, tdeviec_info *dev_info, char *key)
+*/
+void location_print(const tlocation_info *location)
 {
-#ifdef FINSH_USING_MSH
-    rt_kprintf("dev_register_init is start:\r\n");
-    msh_exec("free", rt_strlen("free"));
-#endif
+    int i;
 
-    if (RT_NULL == key && 0 == rt_strcmp(key, ""))
+    if (RT_NULL == location)
+    {
+        return;
+    }
+
+    rt_kprintf("-------------------location result-------------------------------\r\n");
+    rt_kprintf("timestamp: %s ms \r\n", location->timestamp);
+    printf("point(%s):\r\n\tlatitude:%f\r\n\tlongitude:%f\r\n",
+           location->spatial_reference,
+           location->point.latitude, location->point.longitude);
+    rt_kprintf("accuracy: %d m\r\n", (int)location->accuracy);
+    rt_kprintf("source: %s, spatialReference: %s\r\n",
+               location->source, location->spatial_reference);
+    rt_kprintf("address: %s\r\n", location->address);
+
+    for (i = 0; i < location->context_count && i < CONTEXT_COUNT; i++)
+    {
+        rt_kprintf("context: %s = %s (%s)\r\n", location->context[i].type,
+                   location->context[i].name, location->context[i].code);
+    }
+
+    rt_kprintf("POI: {\"id\": %s,\"type\": %s,\"name\": %s}\r\n",
+               location->place.id, location->place.type, location->place.name);
+    if (location->place.category.name[0] != '\0')
+    {
+        rt_kprintf("POI category: {\"id\": %s,\"name\": %s}\r\n",
+                   location->place.category.id, location->place.category.name);
+    }
+    rt_kprintf("-------------------location result end---------------------------\r\n");
+}
+
+/**
+ * 检查云端访问密钥
+ *
+ * @return RT_EOK: valid
+ *         RT_ERROR: invalid
+ */
+static int wayz_key_check(const char *key)
+{
+    if (RT_NULL == key || key[0] == '\0')
     {
         wayz_error("Visiting the website key failure");
-    }
-    else
-    {
-        rt_memcpy(access_key, key, rt_strlen(key));
-    }
-    
-    // 1 connected to the Internet 
-    if (RT_ERROR == wifi_init(wlan_info->ssid, wlan_info->passwd))
-    {
-        wayz_error("connect to the internet failure\r\n");
-        return WIFI_CONNECT_FAIL;
-    }
-    // 2 Check whether the device is registered
-    if (RT_EOK == query_device())
-    {
-        wayz_error("the device has been registered, no need to register again");
-        return DEV_REGISTER_OK;
-    }
-    // 3 registered handler
-    if (RT_EOK == register_device(dev_info))
-    {
-        rt_kprintf("register device success.\r\n");
-    }
-    else
-    {
-        wayz_error("register device failure.");
-        return DEV_REGISTER_FAIL;
+        return RT_ERROR;
     }
 
-    dev_free(dev_info);
-    return DEV_REGISTER_OK;
+    if (rt_strlen(key) >= KEY_LENGTH)
+    {
+        wayz_error("Visiting the website key is too long");
+        return RT_ERROR;
+    }
+
+    return RT_EOK;
 }
+
 
 /**
  * Get the positioning result function
- * 
+ *
  * @param wlan_info Wifi related information
- * 
  * @param key Visiting the website key
- * 
+ * @param post_data post gnss and cellulars data, obtain positioning results
  * @param location get location result
- * 
- * @return >0: success
- *         =0: location failure
- * 
-*/
-char get_position_info(twifi_info *wlan_info, char *key, tpost_data *post_data, tlocation_info *location)
+ *
+ * @return RT_EOK: success
+ *         RT_ERROR: location failure
+ */
+int wayz_connect(twifi_info *wlan_info)
 {
-    char *url = RT_NULL;
+    if (RT_NULL == wlan_info || RT_NULL == wlan_info->ssid || RT_NULL == wlan_info->passwd)
+    {
+        wayz_error("the wifi info is invalid.");
+        return RT_ERROR;
+    }
+
+    return wifi_init(wlan_info->ssid, wlan_info->passwd);
+}
+
+int get_position_info(twifi_info *wlan_info, const char *key, const tpost_data *post_data, \
+                      tlocation_info *location)
+{
+    char url[URL_BUFFER_SIZE] = {0};
     unsigned char *buffer = RT_NULL;
-    char result = 0;
     char *cJsonBuffer = NULL;
-    
-    if (RT_NULL == key && 0 == rt_strcmp(key, ""))
+    int status = 0;
+    int result = RT_ERROR;
+
+    if (RT_NULL == wlan_info || RT_NULL == location)
     {
-        wayz_error("Visiting the website key failure");
+        wayz_error("the wifi info or location is invalid.");
+        return RT_ERROR;
     }
-    else
+
+    if (RT_EOK != wayz_key_check(key))
     {
-        rt_memcpy(access_key, key, rt_strlen(key));
+        return RT_ERROR;
     }
-    // 1 scan wifi info 
+
+    /* 1 scan wifi info */
     get_wifi_scan_info();
-    // 2 connect to the internet
+    /* 2 connect to the internet */
     if (RT_ERROR == wifi_init(wlan_info->ssid, wlan_info->passwd))
     {
         wayz_error("connect to the internet failure\r\n");
-        result = RT_ERROR;
-        goto _malloc_fail;
+        goto __exit;
     }
 
-    // 3 Upload data to get positioning results
-    url = (char *)rt_malloc(rt_strlen(DEV_POSTION_URL) + rt_strlen(access_key));
-    if (RT_NULL == url)
-    {
-        result = RT_ERROR;
-        goto _malloc_fail;
-    }
-    rt_memset(url, 0, rt_strlen(DEV_POSTION_URL) + rt_strlen(access_key));
-    rt_sprintf(url, ""DEV_POSTION_URL, access_key);
+    /* 3 Upload data to get positioning results */
     cJsonBuffer = point_cJson_handler(post_data);
-    if (rt_memcmp(cJsonBuffer, STR_ERROR, rt_strlen(STR_ERROR)) == 0)
+    if (RT_NULL == cJsonBuffer)
     {
         wayz_error("location No wifi, GNSS, cellulars signal data");
-        result = RT_ERROR;
-        goto _url_fail;
+        goto __exit;
     }
 
-    buffer = wayz_webclient_post_data(url, cJsonBuffer);
-    if (rt_memcmp(buffer, STR_ERROR, rt_strlen(STR_ERROR)) == 0)
+    rt_snprintf(url, sizeof(url), "%s?response_sprf=%s&access_key=%s",
+                 wayz_track_points_url(), s_response_sprf, key);
+    if (wayz_http_request(url, cJsonBuffer, &buffer, &status) < 0)
     {
         rt_kprintf("\033[31;22m[E/wayz]: visiting http failure\033[0m\r\n");
-        result = RT_ERROR;
-        goto _visit_fail;
+        goto __exit;
+    }
+
+    if (RT_EOK != parse_point_cJson_handler((char *)buffer, location))
+    {
+        wayz_error("parse the location response failed.");
+        goto __exit;
     }
 
     result = RT_EOK;
 
-    parse_point_cJson_handler((char *)buffer, location);
+__exit:
+    if (RT_NULL != buffer)
+    {
+        web_free(buffer);
+    }
+    if (RT_NULL != cJsonBuffer)
+    {
+        rt_free(cJsonBuffer);
+    }
 
-    rt_free(buffer);
-    buffer = RT_NULL;
-
-_visit_fail:
-    rt_free(cJsonBuffer);
-    cJsonBuffer = RT_NULL;
-_url_fail:
-    rt_free(url);
-    url = RT_NULL;
-_malloc_fail:
-
-#ifdef FINSH_USING_MSH
-    rt_kprintf("get_position_info is end:\r\n");
-    msh_exec("free", rt_strlen("free"));
-#endif
     return result;
 }
-
-
