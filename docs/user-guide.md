@@ -46,7 +46,9 @@ RT-Thread online packages
 > 并按 [HTTPS 与证书说明](https-certs.md) 准备证书（RT-Thread 的 mbedTLS 移植默认强制校验证书）。
 >
 > `access_key` 由云端接口规定放在 URL 的 query 参数里：即使启用 https，密钥也仍会出现在 URL 中
-> （只是传输过程被加密）；组件不会把带密钥的完整 URL 打到日志里。
+> （只是传输过程被加密）。
+> ⚠️ 启用 https 时, webclient 在 TLS 连接失败时会把完整 URI(含 access_key) 打进串口日志,
+> 请勿外传串口日志, 或给 webclient 打个日志脱敏补丁。
 
 ### 作为本地包使用
 
@@ -193,8 +195,12 @@ wayz_wgs84_to_gcj02(wgs_lat, wgs_lng, &gcj_lat, &gcj_lng);
 组件**不再自带 NTP 客户端**，上报用的时间戳按以下顺序获取：
 
 1. `wayz_set_time_provider()` 注册的提供者；
-2. 系统时钟 `gettimeofday()`（lwIP / SAL / newlib 都提供）；
-3. 都没有时用"基准时间 + rt_tick 增量"，保证时间戳单调递增。
+2. 系统时钟 `gettimeofday()`（RT-Thread 下它读的是 RTC 设备；没有 RTC、或 RTC 还没校过时直接失败）；
+3. 都没有时用"基准时间 + rt_tick 增量"兜底，保证时间戳单调递增。
+
+> ⚠️ **第 3 步的兜底基准是一个固定值（2020-12-16）**，只是"看起来合法"，不是真实时间。
+> 没有 RTC 的设备请务必用 `wayz_set_time_provider()` 接入真实时间源
+> （平台自带的 NTP/SNTP 组件，或自己联网同步），否则云端收到的时间戳是错的。
 
 需要精确校时的设备，请用平台自带的 NTP/SNTP 组件校准系统时钟，或注册一个自己的时间源：
 
@@ -230,6 +236,19 @@ while (1)
     rt_memset(&location, 0, sizeof (location));
 }
 ```
+
+## 已知限制与注意事项
+
+- **WLAN 事件回调是全局单槽**：RT-Thread 的 `rt_wlan_register_event_handler()` 每个事件类型只保存一个回调，
+  组件在扫描期间会占用并随后清除 `RT_WLAN_EVT_SCAN_REPORT` / `SCAN_DONE` / `READY` / `STA_DISCONNECTED` 槽位。
+  因此**不要**同时使用 finsh 的 `wifi scan` 命令，也不要注册自己的同名回调 —— 它们会互相顶掉。
+  该限制来自 RT-Thread 框架设计（已建议上游改为支持多回调）。
+- **轮询频率**：云端配额为 日 3000 次 / 秒 5 次，示例的 3 秒轮询一天约 2.9 万次会超限。
+  量产建议放到 30 秒以上，并根据 `get_position_info()` 的返回值退避
+  （`WAYZ_ERR_RATE_LIMIT` 退避重试，`WAYZ_ERR_AUTH` 直接停止重试）。
+- **线程安全**：`get_position_info()` 内部已串行化，并发调用安全；但不要在组件回调里再调用它。
+- **扫描结果由驱动决定**：组件会上报信号最强的 10 个 AP；云端要求 4~10 个，不足 4 个时会上报失败
+  （`WAYZ_ERR_NO_SIGNAL`）。
 
 ## 无 WiFi 硬件时的仿真
 

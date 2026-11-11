@@ -154,6 +154,36 @@ typedef struct _location_info_
   可直接使用独立工具模块 `inc/wayz_coord.h` / `src/wayz_coord.c`：
   `wayz_gcj02_to_wgs84()` / `wayz_wgs84_to_gcj02()`。
 
+## 返回码
+
+`get_position_info()` / `wayz_connect()` 成功返回 `RT_EOK`(0), 失败返回下列负值:
+
+| 返回码 | 含义 | 上层应该怎么做 |
+| ------ | ---- | -------------- |
+| `WAYZ_ERR_PARAM`(-1) | 参数非法(access_key 为空/超长、URL 超长等) | 修正调用方式, 不要重试 |
+| `WAYZ_ERR_NET`(-2) | 网络 / DNS / TLS 失败 | 可退避重试 |
+| `WAYZ_ERR_AUTH`(-3) | 云端 401/403: access_key 无效或无权限 | **不要重试**, 换密钥 |
+| `WAYZ_ERR_RATE_LIMIT`(-4) | 云端 429: 触发限流(配额为 日 3000 次 / 秒 5 次) | 退避重试, 并降低轮询频率 |
+| `WAYZ_ERR_SERVER`(-5) | 云端 5xx | 可退避重试 |
+| `WAYZ_ERR_NO_SIGNAL`(-6) | 云端返回 200 但没有定位结果(无线信号不足) | 换环境/增加 AP 数量, 不要高频重试 |
+| `WAYZ_ERR_PARSE`(-7) | 响应格式异常 | 记录原始响应排查 |
+| `WAYZ_ERR_INTERNAL`(-8) | 内部错误(内存不足等) | 可重试 |
+
+> `WAYZ_ERR_PARAM` 与 `RT_ERROR` 同值(-1), 原来 `!= RT_EOK` 的判断依然有效。
+
+## 线程安全
+
+- `get_position_info()` 内部会串行化(互斥量), **并发调用是安全的**, 但后到者会等待前一次完成;
+- `wayz_set_scan_result()` / `wayz_set_response_sprf()` / `wayz_set_time_provider()` 可在任意线程调用;
+- 但**不要**在组件回调里再调用 `get_position_info()`(会自锁), 也不要在一次定位过程中切换坐标系/时间源。
+
+## 已知限制
+
+- **WLAN 事件回调是全局单槽**: RT-Thread 的 `rt_wlan_register_event_handler()` 每个事件只保存一个回调,
+  组件在扫描期间会占用并随后清除 `RT_WLAN_EVT_SCAN_REPORT` / `SCAN_DONE` / `READY` / `STA_DISCONNECTED` 槽位。
+  因此**不要**同时使用 finsh 的 `wifi scan` 命令或应用自己注册的同名回调(它们会互相顶掉)。
+  该限制来自 RT-Thread 的框架设计, 已建议上游改为多回调。
+
 ## 从 v1.0.x 迁移到 v1.1.0
 
 | v1.0.x | v1.1.0 | 说明 |

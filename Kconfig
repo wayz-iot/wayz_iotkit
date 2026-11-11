@@ -1,0 +1,49 @@
+menuconfig PKG_USING_WAYZ_IOTKIT
+    bool "wayz iotkit: WAYZ location cloud client"
+    default n
+    select PKG_USING_WEBCLIENT
+    select PKG_USING_CJSON
+    help
+        通过 WAYZ 定位云实现 WiFi / GNSS / 基站定位。
+        组件默认使用 http, 不需要 TLS 组件与设备证书。
+
+if PKG_USING_WAYZ_IOTKIT
+
+    config PKG_WAYZ_IOTKIT_WIFI_SSID
+        string "wifi ssid used by the sample"
+        default "thread"
+
+    config PKG_WAYZ_IOTKIT_WIFI_PASSWORD
+        string "wifi password used by the sample"
+        default "12345678"
+
+    config PKG_WAYZ_IOTKIT_USE_HTTPS
+        bool "use https for the WAYZ cloud API"
+        default n
+        help
+            需要 webclient 启用 mbedTLS/SAL, 并让设备内置服务端证书链对应的根证书,
+            详见 docs/https-certs.md。
+
+    config PKG_WAYZ_IOTKIT_NO_WLAN
+        bool "build without the WLAN framework"
+        default n
+        help
+            没有 WiFi 芯片的 BSP(仿真器 / qemu)可以打开它,
+            此时组件只能使用 wayz_set_scan_result() 注入的扫描结果。
+
+    config PKG_WAYZ_IOTKIT_SIM
+        bool "simulation mode for the sample"
+        default n
+        help
+            仿真模式: 示例自动注入一组 AP 与设备 MAC, 并允许用环境变量
+            WAYZ_ACCESS_KEY / WAYZ_SIM_APS / WAYZ_SPRF 覆盖运行参数。
+
+    config PKG_WAYZ_IOTKIT_COORD
+        bool "build the local coordinate conversion helper"
+        default n
+        help
+            wayz_coord.c 是独立工具模块(gcj02 <-> wgs84)。
+            定位链路本身不做换算(由云端的 response_sprf 参数决定),
+            默认不编译该模块, 避免给所有用户引入 libm 依赖。
+
+endif
