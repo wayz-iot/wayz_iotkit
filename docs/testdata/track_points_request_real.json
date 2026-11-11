@@ -1,0 +1,46 @@
+{
+  "timestamp": 1793950786366,
+  "id": "38efe26e-bcd8-020000000001",
+  "asset": {
+    "id": "020000000001",
+    "manufacturer": "SIM",
+    "model": "SIM",
+    "serialNumber": "SIM0001",
+    "macAddress": "02:00:00:00:00:01"
+  },
+  "location": {
+    "timestamp": 1793950786366,
+    "wifis": [
+      {
+        "macAddress": "4c:ef:56:08:35:8d",
+        "signalStrength": 73,
+        "timestamp": 1793950786366
+      },
+      {
+        "macAddress": "4c:ef:56:00:35:8d",
+        "signalStrength": 74,
+        "timestamp": 1793950786366
+      },
+      {
+        "macAddress": "00:19:70:a2:66:5d",
+        "signalStrength": 79,
+        "timestamp": 1793950786366
+      },
+      {
+        "macAddress": "3c:67:c8:d9:b6:37",
+        "signalStrength": 80,
+        "timestamp": 1793950786366
+      },
+      {
+        "macAddress": "70:3d:15:9c:bc:50",
+        "signalStrength": 83,
+        "timestamp": 1793950786366
+      },
+      {
+        "macAddress": "7a:ec:97:28:bf:ea",
+        "signalStrength": 91,
+        "timestamp": 1793950786366
+      }
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "asset": "390928a0-06d4-11e9-a952-024cxxxxxxxx",
+  "location": {
+    "timestamp": 1515743846504,
+    "address": {
+      "name": "上海市浦东新区花木街道",
+      "context": [
+        { "type": "Country",   "name": "中国",   "code": "CN" },
+        { "type": "Province", "name": "上海市", "code": "310000" },
+        { "type": "City",     "name": "上海市", "code": "310000" },
+        { "type": "District", "name": "浦东新区", "code": "310115" },
+        { "type": "Township", "name": "花木街道", "code": "310115125" }
+      ]
+    },
+    "place": {
+      "type": "Entity",
+      "name": "中建东湖明珠国际公馆",
+      "distance": { "line": 3.7579 }
+    },
+    "position": {
+      "timestamp": 1730790836549,
+      "source": "wifi",
+      "point": { "longitude": 121.604634, "latitude": 31.179703 },
+      "spatialReference": "gcj02",
+      "accuracy": 30
+    }
+  }
+}

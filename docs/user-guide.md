@@ -4,9 +4,12 @@
 
 wayz_iotkit 的基本工作流程如下所示：
 
-- 初始化 wifi、设备相关信息
-- 将设备注册到平台上
-- 获取定位结果(gcj02和wgs84标准)以及POI信息
+- 初始化 wifi 参数
+- 连接网络
+- 上报扫描到的 wifi 信息（可选 GNSS/基站数据），取回定位结果(gcj02和wgs84标准)以及POI信息
+
+> 组件只与云端的 **track_points** 接口交互。云端在收到第一个轨迹点时会自动创建设备，
+> 因此**不需要**再调用设备注册接口。
 
 ## menuconfig 配置说明
 
@@ -19,7 +22,7 @@ wayz_iotkit 的基本工作流程如下所示：
 ```shell
 RT-Thread online packages
     IOT - internet of things --->
-        [*] wayz_iotkit: wayz iot location   # 打开 wayz_iotkit 软件包
+        [*] wayz iotkit: wayz iot location   # 打开 wayz_iotkit 软件包
             (wayz123) wifi ssid              # wifi 名字
             (wayz1234) wifi password         # wifi 密码
             Version (latest)   --->          # 选择软件包版本，默认为最新版本
@@ -29,20 +32,41 @@ RT-Thread online packages
 
 - 注：wifi 名字和密码 供软件包切换模式用
 
+### 依赖组件
+
+| 组件 | 是否必需 | 说明 |
+| ---- | -------- | ---- |
+| WLAN 框架 | 必需 | 需要有 WiFi 芯片；仿真环境可用 `wayz_set_scan_result()` 注入扫描结果绕过 |
+| webclient | 必需 | HTTP(S) 客户端 |
+| cJSON | 必需 | JSON 组包/解包 |
+| mbedTLS | **仅启用 HTTPS 时必需** | 证书配置见 [HTTPS 与证书说明](https-certs.md) |
+
+> **传输协议**：组件**默认使用 `http://`** —— 不依赖 TLS 组件，也不需要设备内置根证书。
+> 需要 https 时，在 BSP 的 `rtconfig.h` 里定义 `PKG_WAYZ_IOTKIT_USE_HTTPS`，
+> 并按 [HTTPS 与证书说明](https-certs.md) 准备证书（RT-Thread 的 mbedTLS 移植默认强制校验证书）。
+>
+> `access_key` 由云端接口规定放在 URL 的 query 参数里：即使启用 https，密钥也仍会出现在 URL 中
+> （只是传输过程被加密）；组件不会把带密钥的完整 URL 打到日志里。
+
+### 作为本地包使用
+
+在线包索引会生成 `PKG_USING_WAYZ_IOTKIT` 等配置项；如果把本仓库直接拷贝到 BSP 的
+`packages/` 目录下使用，需要自己在 `packages/Kconfig` 中加入：
+
+```kconfig
+menuconfig PKG_USING_WAYZ_IOTKIT
+    bool "wayz iotkit: WAYZ location cloud client"
+    default n
+    select PKG_USING_WEBCLIENT
+    select PKG_USING_CJSON
+```
+
 ## 工作原理
+
 设备中wifi模块获取周围环境中的wifi信息，组包通过http方式上传到WAYZ定位云平台，云平台进行分析后将经纬度等其他信息一并返回到软件包，软件包通过处理可以得到gcj02和wgs84标准的经纬度，和POI信息。也可以通过传入gnss、基站等相关数据获取定位结果及其POI信息
 
-## wifi、设备相关初始化
+## wifi 参数初始化
 ```c
-typedef struct _device_info_            // 设备信息
-{
-    char *dev_name;                     // 设备名称
-    char *manufacturer;                 // 设备制造厂家
-    char *SN;                           // 设备序列号
-    char *product;                      // 设备所属产品
-    char *tenant;                       // 设备所属租户，通常是开放平台的用户 ID
-}tdeviec_info;
-
 typedef struct _wifi_info_              // wifi 相关信息
 {
     char *ssid;                         // 保存wifi名称
@@ -50,33 +74,29 @@ typedef struct _wifi_info_              // wifi 相关信息
 }twifi_info;
 ```
 
-`twifi_info` 用于保存建立连接的 wifi相关信息，在设备上传`周围wifi信息`时联网使用。用户在使用 WiFi 建立连接会话前，必须定义一个存储会话内容的结构体，如下所示：
+`twifi_info` 用于保存建立连接的 wifi相关信息，在设备上传`周围wifi信息`时联网使用：
 
 ```c
-twifi_info *wlan_info;
-wlan_info = wifi_param_init(WIFI_SSID, WIFI_PWD);
-```
-
-`tdeviec_info` 用于保存注册到平台设备信息，在设备注册使用。用户在使用连接会话前，必须定义一个存储会话内容的结构体，如下所示：
-
-```c
-tdeviec_info *dev_info;
-dev_info = dev_para_init(DEV_NAME, VENDER, PRODUCT, SN, TENANT);
-```
-
-## 设备注册
-
-应用程序使用`dev_register_init`函数注册设备到平台。**其中ACCESS_KEY需要在平台申请**
-
-示例代码如下所示：
-```c
-ret = dev_register_init(wlan_info, dev_info, ACCESS_KEY);
-if (ret != DEV_REGISTER_OK)
+twifi_info *wlan_info = RT_NULL;
+if (RT_EOK != wifi_param_init(WIFI_SSID, WIFI_PWD, &wlan_info))
 {
-    rt_kprintf("\033[31;22mdevice register failure. \033[0m\n");
-    return ;
+    /* 初始化失败 */
 }
 ```
+
+用完记得调用 `wifi_info_free(wlan_info)` 释放。
+
+## 连接网络
+
+```c
+if (RT_EOK != wayz_connect(wlan_info))
+{
+    rt_kprintf("connect to the internet failure.\n");
+}
+```
+
+`get_position_info()` 内部也会做一次连接检查（已连接则直接复用），所以如果只想定位一次，
+可以不单独调用 `wayz_connect()`。
 
 ## 填充GNSS、基站信息定位
 ```c
@@ -84,8 +104,9 @@ typedef struct _gnss_unit_
 {
     uint64_t timestamp;         // 数据收集的时间戳（UTC 时间，单位：毫秒）
     double lng;                 // 经度
-    double lat;                 // 纬度 
+    double lat;                 // 纬度
     float accuracy;             // 卫星定位水平精度，单位：米
+    float altitude;             // 海拔，单位：米
 }tgnss_unit;
 
 typedef struct _cell_unit_
@@ -97,6 +118,8 @@ typedef struct _cell_unit_
     uint32_t mnc;               // mobileNetworkCode：当 CDMA 时，为 SID（System ID）码
     uint32_t lac;               // locationAreaCode：当 CDMA 时，为 NID（Network ID）；
                                                      当 LTE 时，为 TAC（Tracking Area code）
+    rt_int32_t signal_strength; // 信号强度，单位：dBm
+    rt_uint8_t connected;        // 是否为当前驻留的小区
 }tcell_unit;
 ```
 通过填充GNSS、基站等数据，传入定位接口即可获取定位结果信息
@@ -110,30 +133,80 @@ typedef struct _cell_unit_
 示例代码如下所示：
 ```c
 tlocation_info location = {0};
-ret = get_position_info(wlan_info, ACCESS_KEY, RT_NULL, &location); 
-if (RT_ERROR == ret)
+ret = get_position_info(wlan_info, ACCESS_KEY, RT_NULL, &location);
+if (RT_EOK != ret)
 {
     rt_kprintf("\033[31;22mthe device failed to obtain latitude and longitude information.\033[0m\n");
 }
 else
 {
-    location_print(location);
+    location_print(&location);
 }
 ```
-- 其中`get_position_info`函数第三个参数为填充的`GNSS和基站数据`，相关操作可以参照[示例文档](docs/samples.md)
+- 其中`get_position_info`函数第三个参数为填充的`GNSS和基站数据`，相关操作可以参照[示例文档](samples.md)
 
 **打印位置信息结果**
 ```c
 -------------------location result-------------------------------
-timestamp: 1606293694990 
+timestamp: 1606293694990 ms
 gcj02:
 	latitude:30.515105
 	longitude:114.401555
 wgs84:
 	latitude:30.517407914397
 	longitude:114.396014616712
-POI: {"id": "7SkEZdfXQfS","type": "Residential","name": "中建东湖明珠国际公馆","categories":[{"id": 10200,"name": "住宅"}]}
+accuracy: 30 m
+source: wifi, spatialReference: gcj02
+address: 上海市闵行区莘庄镇秀文路600号2楼
+context: Country = 中国 (CN)
+context: Province = 上海市 (310000)
+context: City = 上海市 (310100)
+context: District = 闵行区 (310112)
+context: Township = 莘庄镇 (310112101)
+POI: {"id": , "type": Entity, "name": 上海市闵行区医疗保险事务中心}
 -------------------location result end---------------------------
+```
+
+## 坐标系
+
+云端支持 `gcj02` / `wgs84` / `bd09` 三种返回格式，由请求参数 `response_sprf` 指定，
+**组件不做本地坐标换算**，拿到的就是云端给出的坐标：
+
+```c
+/* 默认 gcj02 */
+wayz_set_response_sprf(WAYZ_SPRF_WGS84);   /* 之后云端直接返回 WGS-84 */
+```
+
+结果里的 `location->point.longitude/latitude` 是云端返回的坐标，
+`location->spatial_reference` 是云端回填的实际坐标系。
+
+需要应用侧自己换算时（例如把 GPS 的 WGS-84 转成 gcj02 显示在国内地图上），
+可用独立工具模块 `inc/wayz_coord.h`：
+
+```c
+double gcj_lat, gcj_lng;
+wayz_wgs84_to_gcj02(wgs_lat, wgs_lng, &gcj_lat, &gcj_lng);
+```
+
+## 时间源
+
+组件**不再自带 NTP 客户端**，上报用的时间戳按以下顺序获取：
+
+1. `wayz_set_time_provider()` 注册的提供者；
+2. 系统时钟 `gettimeofday()`（lwIP / SAL / newlib 都提供）；
+3. 都没有时用"基准时间 + rt_tick 增量"，保证时间戳单调递增。
+
+需要精确校时的设备，请用平台自带的 NTP/SNTP 组件校准系统时钟，或注册一个自己的时间源：
+
+```c
+static int my_time_provider(rt_uint64_t *timestamp_ms)
+{
+    /* 例如从 RTC 设备读日历时间再换算成 Unix 时间戳 */
+    *timestamp_ms = my_rtc_epoch_ms();
+    return RT_EOK;
+}
+
+wayz_set_time_provider(my_time_provider);
 ```
 
 ## 定位轮询频次
@@ -144,18 +217,40 @@ POI: {"id": "7SkEZdfXQfS","type": "Residential","name": "中建东湖明珠国�
 ```c
 while (1)
 {
-    ret = get_position_info(wlan_info, ACCESS_KEY, RT_NULL, &location); 
-    if (RT_ERROR == ret)
+    ret = get_position_info(wlan_info, ACCESS_KEY, RT_NULL, &location);
+    if (RT_EOK != ret)
     {
         rt_kprintf("\033[31;22mthe device failed to obtain latitude and longitude information.\033[0m\n");
     }
     else
     {
-        location_print(location);
+        location_print(&location);
     }
     rt_thread_mdelay(POINT_FRQ);
     rt_memset(&location, 0, sizeof (location));
 }
 ```
 
+## 无 WiFi 硬件时的仿真
 
+仿真环境（`bsp/qemu-vexpress-a9`、`bsp/simulator`）没有 WiFi 芯片，
+`rt_wlan_scan_sync()` 无法工作。可以使用示例提供的 `wayz_scan_stub` 命令注入一组
+AP，从而在不依赖硬件的情况下驱动完整的定位流程：
+
+```
+wayz_scan_stub 88:25:93:6f:df:bb,-31,1 94:77:2b:65:1a:00,-43,6 \
+              3c:1e:cc:1a:2b:3c,-55,11 a4:2b:8c:11:22:33,-67,6
+wayz_dev_mac 02:00:00:00:00:01    # 无 WiFi 芯片时设置设备 MAC
+wayz_key <access_key>              # 运行时设置密钥, 避免写死在源码里
+wayz_scan_stub off                 # 恢复真实扫描
+```
+
+参数格式为 `mac,rssi,channel`，云端要求一次上报 4~10 个 WiFi。
+
+也可以在代码中直接调用：
+
+```c
+tapinfo ap = {0};
+/* 填写 ap.tinfoAp[] 与 ap.count 后 */
+wayz_set_scan_result(&ap);
+```
