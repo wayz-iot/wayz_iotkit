@@ -8,6 +8,8 @@
  *
  * 实现为公开的 Krasovsky 偏移算法, 与国内主流实现一致。
  */
+#if defined(PKG_WAYZ_IOTKIT_COORD)
+
 #ifndef __WAYZ_COORD_H__
 #define __WAYZ_COORD_H__
 
@@ -44,3 +46,5 @@ void wayz_wgs84_to_gcj02(double wgs_lat, double wgs_lng, double *gcj_lat, double
 #endif
 
 #endif /* __WAYZ_COORD_H__ */
+
+#endif /* PKG_WAYZ_IOTKIT_COORD */
