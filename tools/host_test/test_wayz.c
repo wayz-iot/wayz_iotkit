@@ -100,30 +100,6 @@ static void set_mac(rt_uint8_t *mac, const char *hex)
     }
 }
 
-static const char *OFFICIAL_RESPONSE =
-"{"
-"  \"asset\": \"390928a0-06d4-11e9-a952-024cxxxxxxxx\","
-"  \"location\": {"
-"    \"timestamp\": 1515743846504,"
-"    \"address\": {"
-"      \"name\": \"上海市浦东新区花木街道\","
-"      \"context\": ["
-"        {\"type\":\"Country\",\"name\":\"中国\",\"code\":\"CN\"},"
-"        {\"type\":\"Province\",\"name\":\"上海市\",\"code\":\"310000\"},"
-"        {\"type\":\"City\",\"name\":\"上海市\",\"code\":\"310000\"},"
-"        {\"type\":\"District\",\"name\":\"浦东新区\",\"code\":\"310115\"},"
-"        {\"type\":\"Township\",\"name\":\"花木街道\",\"code\":\"310115125\"}"
-"      ]},"
-"    \"place\": {\"type\":\"Entity\",\"name\":\"中建东湖明珠国际公馆\",\"distance\":{\"line\":3.7579}},"
-"    \"position\": {"
-"      \"timestamp\": 1730790836549,"
-"      \"source\": \"wifi\","
-"      \"point\": {\"longitude\":121.604634,\"latitude\":31.179703},"
-"      \"spatialReference\": \"gcj02\","
-"      \"accuracy\": 30}"
-"  }"
-"}";
-
 /**
  * 读取仓库内的响应样例, 存在则优先使用(便于用真实响应做回归)
  */
@@ -303,18 +279,20 @@ int main(void)
             snprintf(cand[1], sizeof(cand[1]), "docs/testdata/track_points_response.sample.json");
             snprintf(cand[2], sizeof(cand[2]), "../docs/testdata/track_points_response.sample.json");
             snprintf(cand[3], sizeof(cand[3]), "../../docs/testdata/track_points_response.sample.json");
-            resp = load_first(cands, ncand, (char *)OFFICIAL_RESPONSE);
+            resp = load_first(cands, ncand, NULL);
+        }
+        if (NULL == resp)
+        {
+            printf("[FAIL] 找不到响应样例文件(docs/testdata/)\n");
+            return 1;
         }
 
         i = parse_point_cJson_handler(resp, &location);
-        if (resp != (char *)OFFICIAL_RESPONSE)
-        {
-            free(resp);
-        }
+        free(resp);
     }
     if (RT_EOK != i)
     {
-        printf("[FAIL] 解析官方响应失败\n");
+        printf("[FAIL] 解析响应样例失败\n");
         return 1;
     }
 

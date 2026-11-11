@@ -31,7 +31,7 @@ except Exception:
     pass
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_REQ = os.path.join(BASE_DIR, "docs", "testdata", "track_points_request.json")
+DEFAULT_REQ = os.path.join(BASE_DIR, "docs", "testdata", "track_points_request_real.json")
 SAVE_RESP = os.path.join(BASE_DIR, "docs", "testdata", "track_points_response.json")
 # 与组件默认传输协议保持一致: http(无需 TLS 组件与证书)
 URL = "http://api.newayz.com/location/hub/v1/track_points"

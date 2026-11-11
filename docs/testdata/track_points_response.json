@@ -1,1 +1,54 @@
-{"id":"38efe26e-bcd8-020000000001","asset":"020000000001","location":{"timestamp":1794389756873,"address":{"name":"上海市闵行区莘庄镇秀文路600号2楼","context":[{"type":"Country","name":"中国","code":"CN"},{"type":"Province","name":"上海市","code":"310000"},{"type":"City","name":"上海市","code":"310100"},{"type":"District","name":"闵行区","code":"310112"},{"type":"Township","name":"莘庄镇","code":"310112101"}]},"place":{"type":"Entity","name":"上海市闵行区医疗保险事务中心","distance":{"line":9.659}},"position":{"timestamp":1794389755820,"source":"wifi","point":{"longitude":121.369155,"latitude":31.125781},"spatialReference":"gcj02","accuracy":50}}}
+{
+  "id": "38efe26e-bcd8-020000000001",
+  "asset": "020000000001",
+  "location": {
+    "timestamp": 1794389756873,
+    "address": {
+      "name": "上海市闵行区莘庄镇秀文路600号2楼",
+      "context": [
+        {
+          "type": "Country",
+          "name": "中国",
+          "code": "CN"
+        },
+        {
+          "type": "Province",
+          "name": "上海市",
+          "code": "310000"
+        },
+        {
+          "type": "City",
+          "name": "上海市",
+          "code": "310100"
+        },
+        {
+          "type": "District",
+          "name": "闵行区",
+          "code": "310112"
+        },
+        {
+          "type": "Township",
+          "name": "莘庄镇",
+          "code": "310112101"
+        }
+      ]
+    },
+    "place": {
+      "type": "Entity",
+      "name": "上海市闵行区医疗保险事务中心",
+      "distance": {
+        "line": 9.659
+      }
+    },
+    "position": {
+      "timestamp": 1794389755820,
+      "source": "wifi",
+      "point": {
+        "longitude": 121.369155,
+        "latitude": 31.125781
+      },
+      "spatialReference": "gcj02",
+      "accuracy": 50
+    }
+  }
+}
