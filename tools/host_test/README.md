@@ -1,49 +1,59 @@
 # wayz_iotkit 主机端测试台
 
-在 PC 上直接编译组件本体，验证：
+把组件本体编进 PC 运行，在没有开发板、没有网络的情况下验证：
 
-1. **定位上报请求体**是否符合 WAYZ 官方 API 契约（字段名、类型、数量裁剪）
-2. **响应解析**是否能正确处理云端返回的结构（经纬度、POI、地址、行政区划、坐标系）
-
-不需要开发板、不需要联网、不需要 RT-Thread 环境。
+- 上报请求体是否符合云端契约（字段名、格式、数量裁剪、排序）；
+- 响应解析是否正确，**畸形响应是否被拒绝**；
+- HTTP 链路（URL 拼接、请求头、状态码分级）；
+- 内存是否有泄漏或越界。
 
 ## 使用
 
 ```sh
 cd tools/host_test
 ./build.sh          # Linux / macOS / Git Bash
-# 或 Windows:
-build.bat
+build.bat           # Windows
 ./test_wayz         # 运行
 ```
 
-Windows 下也可以直接用 gcc 命令：
+> **首次运行需要联网一次**：`build.sh` 会自动下载 cJSON（RT-Thread 官方软件包，MIT 许可）到
+> `stub/cJSON.c`。该文件已在 `.gitignore` 中，不入库。
+> 离线环境可以自行把 cJSON 源码放到 `stub/` 下（文件名 `cJSON.c` / `cJSON.h`）。
 
-```sh
-gcc -Wall -Wextra -Wno-unused-parameter \
-    -I stub -I ../../inc -I ../../src \
-    test_wayz.c stub/cJSON.c -o test_wayz.exe
-```
+## 设计要点
 
-## 说明
+这套测试台刻意避免了"桩比真实实现更宽松"导致的假阳性：
 
-- `stub/` 下是 RT-Thread / webclient / WLAN 的**最小桩头文件**与实现，只为让组件能在主机上编译运行，
-  不参与固件构建（固件走 `src/SConscript`）。
-- `test_wayz.c` 通过 `#include "wayz_pos.c"` 把组件本体编进来，以便访问其内部静态函数
-  （`point_cJson_handler` / `parse_point_cJson_handler`）。
-- `cJSON.c` / `cJSON.h` 来自 RT-Thread 官方软件包仓库（MIT 许可）：
-  <https://github.com/RT-Thread-packages/cJSON>，`build.sh` 会自动下载。
-- 响应样例取自 WAYZ 官方 API 文档 `https://lothub.newayz.com/pdf/api.pdf`，
-  保存在 `docs/testdata/track_points_response.sample.json`，可用真实响应覆盖后做回归。
+| 问题 | 做法 |
+| ---- | ---- |
+| 桩的版本语义与目标平台不一致 | 按 RT-Thread **5.x** 实现（`RTTHREAD_VERSION=50200`、`RT_NAME_MAX=12`），`rt_wlan_info` 与 5.x 对齐（`ssid` 是 `rt_wlan_ssid_t`、`channel` 是 `int16_t`） |
+| 分配器与真实实现一致导致错配不可见 | **私有分配器**：magic 头 + 前后哨兵字节 + 记账，测试结束断言 `live allocations == 0`、`guard broken == 0` |
+| HTTP 链路完全没被覆盖 | 实现**最小 webclient 桩**：记录请求 URL / 头 / 体，并返回预置响应，使 `get_position_info()` 全链路进入覆盖 |
+| 断言太弱（只判范围） | **字段级精确比对**：时间戳位数、经纬度逐位、POI/地址字节数、`context` 条目内容 |
+| 畸形输入没人测 | 12 组畸形响应用例，全部要求返回非 `RT_EOK`，且输出结构体必须被清零 |
 
 ## 覆盖的检查项
 
-| 检查项 | 说明 |
-| ------ | ---- |
-| 请求体字段 | `timestamp` / `id` / `asset` / `location` / `wifis` / `macAddress` / `signalStrength` / `frequency` / `channel` / `connected` |
-| id 完整性 | `id` = `38efe26e-bcd8-<MAC12>`（26 字符，不能被截断） |
-| asset 一致性 | `asset.id` 与设备注册时的 id 形式一致（无冒号 MAC） |
-| AP 数量 | 云端要求 4~10 个，注入 20 个时应只上报 10 个 |
-| 经纬度 | 与官方样例逐位比对 |
-| 坐标系 | `spatialReference` 为 `wgs84` 时不重复换算，为 `gcj02` 时做 gcj02→wgs84 换算 |
-| POI / 地址 | `place.name` / `place.type` / `place.distance` / `address.name` / `address.context[]` |
+| 检查项 | 断言方式 |
+| ------ | -------- |
+| 响应解析 | 时间戳 13 位；经纬度逐位比对；`source` / `spatialReference` / `accuracy` / `place.type` / `place.distance` / 5 级行政区划逐项比对；POI 名与地址按字节数校验（防截断） |
+| 畸形响应 | 12 组用例（缺 location / position 非对象 / 无 position / point 为空 / 缺经纬度 / 类型不符 / 越界 / (0,0) / 非法 JSON …）必须全部被拒绝，且输出结构体被清零 |
+| 请求体 | `id` 26 字符且前缀正确；`asset.id` 与设备 MAC 一致；只上报 10 个 AP 且是**信号最强**的 10 个；`macAddress` 大写冒号格式；`frequency` 存在 |
+| HTTP 链路 | URL 含 `access_key` 与 `response_sprf`；请求头含 `Content-Type: application/json` 与 `Content-Length`；请求体是合法 JSON 且含 `wifis` |
+| 状态码分级 | 403→`WAYZ_ERR_AUTH`、429→`WAYZ_ERR_RATE_LIMIT`、500→`WAYZ_ERR_SERVER`、200 无 position→`WAYZ_ERR_NO_SIGNAL` |
+| 内存 | 全部用例结束后 `live allocations == 0`，哨兵字节未被破坏 |
+
+## 变异测试（验证断言本身有效）
+
+`mutation_check.py` 会往组件源码里注入一个缺陷，看回归是否变红 —— 全部变异都应被抓住；
+有逃逸就说明断言太弱。
+
+```sh
+python tools/host_test/mutation_check.py
+```
+
+当前覆盖 10 个变异体：id 截断、时间戳恒 0、MAC 去冒号、frequency 写死、字符串拷贝改成无界（堆溢出）、
+云端没定位也算成功、AP 不裁剪、经纬度互换、AP 不按强度排序、状态码不分类。
+
+> 该脚本会在 `C:/wz` 下建立临时副本（Windows 的链接器无法处理含中文的输出路径，
+> 所以临时目录名用 ASCII）。
