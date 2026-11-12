@@ -13,7 +13,7 @@
 
 #define  VER_H               1
 #define  VER_M               1
-#define  VER_L               0
+#define  VER_L               1        /* v1.1.1 */
 
 #define  AP_MAX_NUMBER       100
 #define  AP_MIN_UPLOAD       4       /* 云端要求至少 4 个 WiFi */
