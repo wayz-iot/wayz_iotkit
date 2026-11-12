@@ -354,7 +354,12 @@ git ls-remote https://github.com/wayz-iot/wayz_iotkit.git v1.1.1
 | ③ 推送 | master → `2133fdd`；tag `v1.1.1` 已推送 |
 | ④ 索引 Kconfig | 补 4 个配置项 + `V111` 选项；`PKG_USING_WAYZ_IOTKIT_VER` 三档 default |
 | ⑤ 索引 package.json | `license` → `LGPL-2.1`；`site` 增加 `v1.1.1`(2133fdd) 与 `v1.0.0`(1ef0b17)；补 description/keywords |
-| ⑥ 索引 PR | **https://github.com/wayz-iot/packages/pull/1**（open，mergeable clean，2 文件 +68/−7） |
+| ⑥ 索引 PR(fork) | **https://github.com/wayz-iot/packages/pull/1**（open，mergeable clean，2 文件 +68/−7） |
+| ⑥ 索引 PR(上游) | **https://github.com/RT-Thread/packages/pull/2054**（open，mergeable clean；上游 CI 三项全绿：`pull-request-package-validation` / `tools-check` / `detect-pull-request-packages` 均 success） |
+
+> 上游 CI 校验内容：category/enable/license/author 必填、`repository` 与每个 `site[].URL` 可达、
+> `.git` 形式的 URL 必须带有效 `VER_SHA`（分支或已存在的提交）、Kconfig 可被 kconfiglib 解析。
+> 本地已用上游同一份 `ci.py` 预检通过（URL 可达 + 两个 sha 均存在）。
 
 **待办 / 可选项**：
 
