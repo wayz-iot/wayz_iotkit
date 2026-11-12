@@ -341,7 +341,38 @@ git ls-remote https://github.com/wayz-iot/wayz_iotkit.git v1.1.1
 
 ---
 
-## 六、执行顺序一览
+## 六、执行记录（2026-11-12 已执行）
+
+| 步骤 | 结果 |
+|------|------|
+| ① 发布前检查 · 编译矩阵 | RT-Thread 4.1/5.0/5.1/5.2/6.0 + SIM/NO_WLAN —— **全部零警告** |
+| ① 发布前检查 · 主机端回归 | **全部通过**，live allocations: 0，guard broken: 0 |
+| ① 发布前检查 · 变异测试 | **10/10 变异体全部被抓住** |
+| ① 发布前检查 · 端到端(mock) | 通过：URL / 请求头 / 请求体 / 响应解析 / 定点格式化输出均正确 |
+| ② 版本宏对齐 | `inc/wayz_pos.h` VER_L 0 → 1（1.1.1），提交 `2133fdd` |
+| ③ 打 tag | **`v1.1.1`**（注释 tag），`VER_SHA = 2133fdd3d57e5e774a917ac62e6044bdeeedaff3` |
+| ③ 推送 | master → `2133fdd`；tag `v1.1.1` 已推送 |
+| ④ 索引 Kconfig | 补 4 个配置项 + `V111` 选项；`PKG_USING_WAYZ_IOTKIT_VER` 三档 default |
+| ⑤ 索引 package.json | `license` → `LGPL-2.1`；`site` 增加 `v1.1.1`(2133fdd) 与 `v1.0.0`(1ef0b17)；补 description/keywords |
+| ⑥ 索引 PR | **https://github.com/wayz-iot/packages/pull/1**（open，mergeable clean，2 文件 +68/−7） |
+
+**待办 / 可选项**：
+
+- ⬜ **真实云端复验**（发布门禁的第四项，因工具策略无法由助手代跑，需在本地执行）：
+  ```sh
+  cd C:/Users/admin/rtwork/rt-thread/bsp/simulator
+  WAYZ_ACCESS_KEY=<key> WAYZ_SIM_APS="4c:ef:56:08:35:8d,-73 ..." WAYZ_SPRF=wgs84 timeout 20 ./application.exe
+  ```
+  预期 `point(wgs84): 31.127691 / 121.364539` + POI + 5 级行政区划。
+  若发现异常，走 §四 的回滚流程（发 v1.1.2，索引改 `VER_SHA`）。
+- ⬜ 合并索引 PR（#1）到 `wayz-iot/packages` 的 master。
+- ⬜ 可选：给组件仓库建 GitHub Release（tag 说明已写好）。
+- ⬜ 可选：`docs/testdata/track_points_request_real.json` 里的真实 BSSID 换成合成 MAC。
+- ⬜ 可选：把组件发布到**上游 `RT-Thread/packages` 索引**，避免单点依赖 `wayz-iot` 这个源。
+
+---
+
+## 七、执行顺序一览
 
 ```
 组件仓库                              索引仓库
