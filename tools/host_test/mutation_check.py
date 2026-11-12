@@ -50,8 +50,8 @@ MUTATIONS = [
      "while ((j > 0) && ((int)aucApInfo.tinfoAp[order[j - 1]].rssi < key_rssi))",
      "while (0)"),
     ("状态码不分类", "src/wayz_pos.c",
-     "    case 401:\n    case 403:\n        return WAYZ_ERR_AUTH;",
-     "    case 401:\n    case 403:\n        return WAYZ_ERR_NET;"),
+     "        return WAYZ_ERR_AUTH;",
+     "        return WAYZ_ERR_NET;"),
 ]
 
 
@@ -84,12 +84,20 @@ def main():
 
         path = os.path.join(work, rel)
         with io.open(path, "r", encoding="utf-8", newline="") as f:
-            src = f.read()
-        if old not in src:
+            raw = f.read()
+        # 源码可能是 CRLF, 统一按 LF 匹配, 写回时还原
+        crlf = "\r\n" in raw
+        src = raw.replace("\r\n", "\n")
+        old_n = old.replace("\r\n", "\n")
+        new_n = new.replace("\r\n", "\n")
+        if old_n not in src:
             print("%-32s SKIP (未找到锚点)" % name)
             continue
+        out = src.replace(old_n, new_n, 1)
+        if crlf:
+            out = out.replace("\n", "\r\n")
         with io.open(path, "w", encoding="utf-8", newline="") as f:
-            f.write(src.replace(old, new, 1))
+            f.write(out)
 
         b = run(["sh", "build.sh"], os.path.join(work, "tools", "host_test"))
         if b.returncode != 0:
